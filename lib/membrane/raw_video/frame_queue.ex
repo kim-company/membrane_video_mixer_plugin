@@ -1,4 +1,4 @@
-defmodule Membrane.VideoMixer.FrameQueue do
+defmodule Membrane.RawVideo.FrameQueue do
   @type t() :: {{metadata(), erl_queue()}, [{metadata(), erl_queue()}]}
   @type erl_queue() :: {[payload()], [payload()]}
   @type metadata() :: any()

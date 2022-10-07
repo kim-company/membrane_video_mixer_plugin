@@ -1,3 +1,3 @@
-defmodule Membrane.VideoMixer.Mixer.Native do
+defmodule RawVideo.Mixer.Native do
   use Unifex.Loader
 end

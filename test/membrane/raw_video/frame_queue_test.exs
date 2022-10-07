@@ -1,6 +1,7 @@
-defmodule Membrane.VideoMixer.FrameQueueTest do
-  use ExUnit.Case, async: true
-  alias Membrane.VideoMixer.FrameQueue
+defmodule Membrane.RawVideo.FrameQueueTest do
+  use ExUnit.Case
+
+  alias Membrane.RawVideo.FrameQueue
 
   test "init" do
     assert {{nil, {[], []}}, []} == FrameQueue.new()

@@ -86,7 +86,7 @@ defmodule Membrane.RawVideo.MasterMixer do
         state =
           state
           |> put_in([:framerate], framerate)
-          |> get_and_update_in([:queue_by_pad, pad], fn queue ->
+          |> update_in([:queue_by_pad, pad], fn queue ->
             # We're putting FrameSpecs, not caps :D
             FrameQueue.put_caps(queue, frame_spec)
           end)

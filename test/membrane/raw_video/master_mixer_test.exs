@@ -7,6 +7,52 @@ defmodule Membrane.RawVideo.MasterMixerTest do
   alias RawVideo.FrameSpec
 
   @tag :tmp_dir
+  test "forward master video", %{tmp_dir: tmp_dir} do
+    [master_path] =
+      ["blue-16x9-1080-5s.h264"]
+      |> Enum.map(fn name -> Path.join(["test", "fixtures", name]) end)
+
+    master = %Membrane.File.Source{location: master_path}
+    out_path = Path.join([tmp_dir, "output.h264"])
+
+    filter_builder = fn %FrameSpec{width: w, height: h}, _inputs ->
+      "[0:v]scale=#{w}:#{h}:force_original_aspect_ratio=decrease,pad=#{w}:#{h}:-1:-1,setsar=1"
+    end
+
+    children = [
+      master: master,
+      master_parser: %Membrane.H264.FFmpeg.Parser{framerate: {25, 1}},
+      master_decoder: Membrane.H264.FFmpeg.Decoder,
+      mixer: %Membrane.RawVideo.MasterMixer{
+        filter_graph_builder: filter_builder
+      },
+      encoder: Membrane.H264.FFmpeg.Encoder,
+      sink: %Membrane.File.Sink{location: out_path}
+    ]
+
+    links = [
+      link(:master)
+      |> to(:master_parser)
+      |> to(:master_decoder)
+      |> via_in(:master)
+      |> to(:mixer),
+      link(:mixer)
+      |> to(:encoder)
+      |> to(:sink)
+    ]
+
+    assert {:ok, pipeline} = Pipeline.start_link(children: children, links: links)
+
+    assert_end_of_stream(pipeline, :sink, :input, 40_000)
+    Pipeline.terminate(pipeline, blocking?: true)
+
+    have = File.read!(out_path)
+    want = File.read!(master_path)
+    assert have == want
+  end
+
+  @tag :tmp_dir
+  @tag skip: true
   test "mix two 1920x1080 5s as [blue|purple]", %{tmp_dir: tmp_dir} do
     [master, extra] =
       ["blue-16x9-1080-5s.h264", "purple-16x9-1080-5s.h264"]
@@ -15,8 +61,9 @@ defmodule Membrane.RawVideo.MasterMixerTest do
 
     out_path = Path.join([tmp_dir, "output.h264"])
 
-    filter_builder = fn %FrameSpec{width: width, height: height}, inputs when length(inputs) == 2 ->
-      "[0:v]scale=#{width}/2:#{height}:force_original_aspect_ratio=decrease,pad=#{width}/2+1:#{height}:-1:-1,setsar=1[l];[1:v]scale=-1:#{height}/2,crop=#{width}/2:ih:iw/2:0,pad=#{width}/2:#{height}:-1:-1,setsar=1[r];[l][r]hstack" 
+    filter_builder = fn %FrameSpec{width: width, height: height}, inputs
+                        when length(inputs) == 2 ->
+      "[0:v]scale=#{width}/2:#{height}:force_original_aspect_ratio=decrease,pad=#{width}/2+1:#{height}:-1:-1,setsar=1[l];[1:v]scale=-1:#{height}/2,crop=#{width}/2:ih:iw/2:0,pad=#{width}/2:#{height}:-1:-1,setsar=1[r];[l][r]hstack"
     end
 
     children = [
@@ -27,7 +74,7 @@ defmodule Membrane.RawVideo.MasterMixerTest do
       master_decoder: Membrane.H264.FFmpeg.Decoder,
       extra_decoder: Membrane.H264.FFmpeg.Decoder,
       mixer: %Membrane.RawVideo.MasterMixer{
-        filter_graph_builder: filter_builder,
+        filter_graph_builder: filter_builder
       },
       encoder: Membrane.H264.FFmpeg.Encoder,
       sink: %Membrane.File.Sink{location: out_path}

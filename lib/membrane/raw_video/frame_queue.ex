@@ -1,71 +1,81 @@
 defmodule Membrane.RawVideo.FrameQueue do
-  @type t() :: {{metadata(), erl_queue()}, [{metadata(), erl_queue()}]}
-  @type erl_queue() :: {[payload()], [payload()]}
-  @type metadata() :: any()
-  @type payload() :: any()
+  defmodule QexWithCount do
+    defstruct queue: Qex.new(), count: 0
 
-  @spec new() :: t()
-  def new() do
-    {{nil, :queue.new()}, []}
+    def new(), do: %__MODULE__{}
+
+    def push(state = %__MODULE__{queue: queue, count: count}, item) do
+      %__MODULE__{state | queue: Qex.push(queue, item), count: count + 1}
+    end
+
+    def pop!(state = %__MODULE__{queue: queue, count: count}) do
+      {item, queue} = Qex.pop!(queue)
+      {item, %__MODULE__{state | queue: queue, count: count - 1}}
+    end
+
+    def empty?(%__MODULE__{count: 0}), do: true
+    def empty?(_state), do: false
   end
 
-  @doc "Put a frame at the end of the queue"
-  @spec put_frame(t(), payload()) :: t()
-  def put_frame({{caps, queue}, []}, frame) do
-    {{caps, :queue.in(frame, queue)}, []}
+  defstruct [:index, :current_frame_spec, :stream_finished?, :spec_changed?, :ready, :pending]
+
+  def new(index) do
+    %__MODULE__{
+      index: index,
+      current_frame_spec: nil,
+      spec_changed?: false,
+      stream_finished?: false,
+      ready: QexWithCount.new(),
+      pending: QexWithCount.new()
+    }
   end
 
-  def put_frame({front, [{caps, queue} | back]}, frame) do
-    {front, [{caps, :queue.in(frame, queue)} | back]}
-  end
+  def push(state = %__MODULE__{pending: pending, ready: ready}, spec = %RawVideo.FrameSpec{}) do
+    state = %{state | spec_changed?: true, current_frame_spec: spec}
 
-  @doc "Create a new item with the selected caps"
-  @spec put_caps(t(), metadata()) :: t()
-  def put_caps({front, list}, caps) do
-    {front, [{caps, :queue.new()} | list]}
-  end
+    if QexWithCount.empty?(pending) do
+      state
+    else
+      frames = Enum.into(pending.queue, [])
 
-  @doc """
-  Get a frame from the queue. If the first item is empty, switches the current caps to the next one in the queue.
-  """
-  @spec get_frame(t()) :: {{:ok | :change, payload()} | :empty, t()}
-  def get_frame(queue = {{_, {[], []}}, []}), do: {:empty, queue}
+      pending_accepted? =
+        frames
+        |> Enum.map(fn x -> RawVideo.FrameSpec.compatible?(spec, x) end)
+        |> Enum.all?()
 
-  def get_frame(input = {{_caps, {[], []}}, back}) do
-    [{caps, queue} | back] = Enum.reverse(back)
+      if !pending_accepted? do
+        raise ArgumentError,
+              "frame queue received spec #{inspect(spec)} which is not compatible with the pending frame queue (size #{pending.count})"
+      end
 
-    case :queue.out(queue) do
-      {{:value, frame}, queue} ->
-        {{:change, frame}, {{caps, queue}, Enum.reverse(back)}}
-
-      {:empty, _queue} ->
-        {:empty, input}
+      Enum.reduce(frames, state, fn x, state -> push(state, x) end)
     end
   end
 
-  def get_frame({{caps, queue}, back}) do
-    {{:value, frame}, queue} = :queue.out(queue)
+  def push(state = %__MODULE__{current_frame_spec: spec}, frame = %RawVideo.Frame{}) do
+    if spec == nil or !RawVideo.FrameSpec.compatible?(spec, frame) do
+      %{state | pending: QexWithCount.push(state.pending, frame)}
+    else
+      ready =
+        QexWithCount.push(state.ready, %{
+          index: state.index,
+          frame: frame,
+          spec: spec,
+          spec_changed?: state.spec_changed?
+        })
 
-    {{:ok, frame}, {{caps, queue}, back}}
+      %{state | ready: ready, spec_changed?: false}
+    end
   end
 
-  @doc "Read the first caps in the queue"
-  @spec read_caps(t()) :: metadata()
-  def read_caps({{caps, _}, _}), do: caps
+  def ready?(%__MODULE__{ready: %QexWithCount{count: count}}), do: count > 0
 
-  @spec frames_length(t()) :: integer()
-  def frames_length({{_caps, queue}, []}), do: :queue.len(queue)
-
-  def frames_length({{_caps, queue}, [head | back]}) do
-    :queue.len(queue) + frames_length({head, back})
+  def closed?(%__MODULE__{stream_finished?: done, ready: ready}) do
+    QexWithCount.empty?(ready) and done
   end
 
-  @spec initialized?(t()) :: boolean()
-  def initialized?({{nil, _}, _}), do: false
-  def initialized?(_), do: true
-
-  @spec empty?(t()) :: boolean()
-  def empty?({{_caps, {[], []}}, []}), do: true
-  def empty?({{_caps, {[], []}}, [head | tail]}), do: empty?({head, tail})
-  def empty?(_), do: false
+  def pop!(state = %__MODULE__{ready: ready}) do
+    {value, ready} = QexWithCount.pop!(ready)
+    {value, %{state | ready: ready}}
+  end
 end

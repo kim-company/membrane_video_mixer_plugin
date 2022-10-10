@@ -601,5 +601,6 @@ defmodule MixerTest do
 
     assert_end_of_stream(pipeline, :sink, :input, 40000)
     Pipeline.terminate(pipeline, blocking?: true)
+
   end
 end

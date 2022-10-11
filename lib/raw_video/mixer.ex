@@ -17,14 +17,14 @@ defmodule RawVideo.Mixer do
   @type spec_mapping_t :: [FrameSpec.t()]
 
   @type t :: %__MODULE__{mapping: spec_mapping_t(), ref: reference()}
-  defstruct [:mapping, :ref]
+  defstruct [:mapping, :ref, :filter_indexes]
 
   @doc """
   Initializes the mixer. `mapping` frames must be numbered from 0 to
   length(mapping)-1. Ordering is not important.
   """
   @spec init(filter_graph_t(), spec_mapping_t(), FrameSpec.t()) :: {:ok, t()} | {:error, any}
-  def init(filter, mapping, output_frame_spec) do
+  def init({filter_graph, filter_indexes}, mapping, output_frame_spec) do
     [widths, heights, formats] =
       mapping
       |> Enum.map(fn %FrameSpec{width: w, height: h, pixel_format: f} -> [w, h, f] end)
@@ -33,9 +33,9 @@ defmodule RawVideo.Mixer do
 
     %FrameSpec{width: out_width, height: out_height, pixel_format: out_format} = output_frame_spec
 
-    case Native.init(widths, heights, formats, filter, out_width, out_height, out_format) do
+    case Native.init(widths, heights, formats, filter_graph, out_width, out_height, out_format) do
       {:ok, ref} ->
-        {:ok, %RawVideo.Mixer{ref: ref, mapping: mapping}}
+        {:ok, %RawVideo.Mixer{ref: ref, mapping: mapping, filter_indexes: filter_indexes}}
 
       {:error, reason} ->
         {:error, reason}
@@ -43,9 +43,12 @@ defmodule RawVideo.Mixer do
   end
 
   @spec mix(t(), [Frame.t()]) :: {:ok, binary()} | {:error, any()}
-  def mix(%__MODULE__{ref: ref, mapping: mapping}, frames) do
+  def mix(%__MODULE__{ref: ref, mapping: mapping, filter_indexes: filter_indexes}, frames) do
     with :ok <- assert_spec_compatibility(mapping, frames, 0) do
       frames
+      |> Enum.with_index()
+      |> Enum.filter(fn {_frame, index} -> Enum.member?(filter_indexes, index) end)
+      |> Enum.map(fn {frame, _index} -> frame end)
       |> Enum.map(fn %Frame{data: x} -> x end)
       |> Native.mix(ref)
     end

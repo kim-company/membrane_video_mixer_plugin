@@ -151,6 +151,8 @@ defmodule Membrane.RawVideo.MasterMixer do
       {{:ok, [end_of_stream: :output]}, state}
     else
       # delete all inputs that are now closed.
+      prev_queues_count = map_size(state.queue_by_pad)
+
       state =
         update_in(state, [:queue_by_pad], fn queue_by_pad ->
           queue_by_pad
@@ -160,6 +162,9 @@ defmodule Membrane.RawVideo.MasterMixer do
             Map.delete(acc, pad)
           end)
         end)
+
+      cur_queues_count = map_size(state.queue_by_pad)
+      specs_removed? = prev_queues_count != cur_queues_count
 
       # redemand raw videos on pads that are not ready yet.
 
@@ -171,7 +176,7 @@ defmodule Membrane.RawVideo.MasterMixer do
       ready? = length(pads_not_ready) == 0
 
       if ready? do
-        mix(state)
+        mix(state, specs_removed?)
       else
         actions = Enum.map(pads_not_ready, fn _pad -> {:redemand, :output} end)
         {{:ok, actions}, state}
@@ -179,7 +184,7 @@ defmodule Membrane.RawVideo.MasterMixer do
     end
   end
 
-  defp mix(state = %{builder: builder, mixer: mixer}) do
+  defp mix(state = %{builder: builder, mixer: mixer}, specs_removed?) do
     {values, state} =
       Enum.map_reduce(state.queue_by_pad, state, fn {pad, queue}, state ->
         {value, queue} = FrameQueue.pop!(queue)
@@ -194,7 +199,7 @@ defmodule Membrane.RawVideo.MasterMixer do
       |> Enum.any?()
 
     mixer =
-      if specs_changed? or mixer == nil do
+      if specs_changed? or mixer == nil or specs_removed? do
         specs = Enum.map(values, fn %{spec: x} -> x end)
         [master_spec | _] = specs
         filter = builder.(master_spec, specs)

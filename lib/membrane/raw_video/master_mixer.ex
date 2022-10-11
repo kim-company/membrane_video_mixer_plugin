@@ -173,7 +173,7 @@ defmodule Membrane.RawVideo.MasterMixer do
       if ready? do
         mix(state)
       else
-        actions = Enum.map(pads_not_ready, fn pad -> {:redemand, :output} end)
+        actions = Enum.map(pads_not_ready, fn _pad -> {:redemand, :output} end)
         {{:ok, actions}, state}
       end
     end

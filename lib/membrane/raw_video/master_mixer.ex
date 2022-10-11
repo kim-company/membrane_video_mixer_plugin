@@ -230,8 +230,10 @@ defmodule Membrane.RawVideo.MasterMixer do
   end
 
   defp close_frame_queue(state, pad) do
-    update_in(state, [:queue_by_pad, pad], fn queue ->
-      FrameQueue.push(queue, :end_of_stream)
+    update_in(state, [:queue_by_pad, pad], fn
+      # Happens when end_of_stream is received before pad removed callback.
+      nil -> nil
+      queue -> FrameQueue.push(queue, :end_of_stream)
     end)
   end
 

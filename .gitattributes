@@ -21,3 +21,6 @@ test/fixtures/purple-16x9-720-5s.h264 filter=lfs diff=lfs merge=lfs -text
 test/fixtures/purple-16x9-1080-5s.h264 filter=lfs diff=lfs merge=lfs -text
 test/fixtures/red-4x3-1080-5s.h264 filter=lfs diff=lfs merge=lfs -text
 test/fixtures/red-4x3-1080-10s.h264 filter=lfs diff=lfs merge=lfs -text
+test/fixtures/green_frame.h264 filter=lfs diff=lfs merge=lfs -text
+test/fixtures/output.mp4 filter=lfs diff=lfs merge=lfs -text
+test/fixtures/red_frame.h264 filter=lfs diff=lfs merge=lfs -text

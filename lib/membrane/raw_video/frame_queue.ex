@@ -30,7 +30,7 @@ defmodule Membrane.RawVideo.FrameQueue do
     }
   end
 
-  def push(state = %__MODULE__{pending: pending, ready: ready}, spec = %RawVideo.FrameSpec{}) do
+  def push(state = %__MODULE__{pending: pending}, spec = %RawVideo.FrameSpec{}) do
     state = %{state | spec_changed?: true, current_frame_spec: spec}
 
     if QexWithCount.empty?(pending) do

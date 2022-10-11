@@ -68,6 +68,10 @@ defmodule Membrane.RawVideo.FrameQueue do
     end
   end
 
+  def push(state = %__MODULE__{}, :end_of_stream) do
+    %{state | stream_finished?: true}
+  end
+
   def ready?(%__MODULE__{ready: %QexWithCount{count: count}}), do: count > 0
 
   def closed?(%__MODULE__{stream_finished?: done, ready: ready}) do

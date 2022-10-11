@@ -1,11 +1,12 @@
 defmodule RawVideo.FrameSpec do
   @type t :: %__MODULE__{
+          reference: any(),
           width: pos_integer(),
           height: pos_integer(),
           pixel_format: atom(),
           expected_frame_size: integer()
         }
-  defstruct [:width, :height, :pixel_format, :expected_frame_size]
+  defstruct [:reference, :width, :height, :pixel_format, :expected_frame_size]
 
   @doc "Returns true if `frame` is compatible with the provided specification."
   @spec compatible?(t(), RawVideo.Frame.t()) :: boolean()

@@ -95,7 +95,7 @@ defmodule Membrane.RawVideo.MasterMixer do
   end
 
   def handle_caps(pad, caps = %Membrane.RawVideo{framerate: framerate}, _ctx, state) do
-    frame_spec = build_frame_spec(caps)
+    frame_spec = build_frame_spec(pad, caps)
 
     state =
       state
@@ -135,6 +135,11 @@ defmodule Membrane.RawVideo.MasterMixer do
     |> mix_if_ready()
   end
 
+  @impl true
+  def handle_other(:rebuild_filter_graph, _ctx, state) do
+    {:ok, %{state | mixer: nil}}
+  end
+
   defp mix_if_ready(state) do
     # Handle closed queues first. If the master one is done, that's it.
     master_closed? =
@@ -168,7 +173,7 @@ defmodule Membrane.RawVideo.MasterMixer do
       if ready? do
         mix(state)
       else
-        actions = Enum.map(pads_not_ready, fn pad -> {:redemand, pad} end)
+        actions = Enum.map(pads_not_ready, fn pad -> {:redemand, :output} end)
         {{:ok, actions}, state}
       end
     end
@@ -220,18 +225,23 @@ defmodule Membrane.RawVideo.MasterMixer do
   end
 
   defp close_frame_queue(state, pad) do
-    state =
-      update_in(state, [:queue_by_pad, pad], fn queue ->
-        FrameQueue.push(queue, :end_of_stream)
-      end)
-
-    {:ok, state}
+    update_in(state, [:queue_by_pad, pad], fn queue ->
+      FrameQueue.push(queue, :end_of_stream)
+    end)
   end
 
-  defp build_frame_spec(%Membrane.RawVideo{width: width, height: height, pixel_format: format}) do
+  defp build_frame_spec(pad, caps) do
+    %Membrane.RawVideo{width: width, height: height, pixel_format: format} = caps
     {:ok, size} = Membrane.RawVideo.frame_size(format, width, height)
 
+    id =
+      case pad do
+        {Membrane.Pad, :extra, id} -> id
+        :master -> :master
+      end
+
     %RawVideo.FrameSpec{
+      reference: id,
       width: width,
       height: height,
       pixel_format: format,

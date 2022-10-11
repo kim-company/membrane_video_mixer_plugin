@@ -10,7 +10,7 @@ defmodule RawVideo.Mixer do
   # Taken from https://libav.org/documentation/libavfilter.html#toc-framepack,
   # this filter graph example packs two different video streams into a
   # stereoscopic video, setting proper metadata on supported codecs.
-  @type filter_graph_t :: String.t()
+  @type filter_graph_t :: {String.t(), [non_neg_integer()]}
 
   # Specifies the expected FrameSpec of each Frame the mixer is going to
   # receive.

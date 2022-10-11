@@ -27,6 +27,9 @@ defmodule RawVideo.Mixer do
   def init({filter_graph, filter_indexes}, mapping, output_frame_spec) do
     [widths, heights, formats] =
       mapping
+      |> Enum.with_index()
+      |> Enum.filter(fn {_x, index} -> Enum.member?(filter_indexes, index) end)
+      |> Enum.map(fn {x, _index} -> x end)
       |> Enum.map(fn %FrameSpec{width: w, height: h, pixel_format: f} -> [w, h, f] end)
       |> Enum.zip()
       |> Enum.map(fn x -> Tuple.to_list(x) end)

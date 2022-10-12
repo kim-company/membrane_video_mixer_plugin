@@ -127,10 +127,12 @@ UNIFEX_TERM mix(UnifexEnv *env, UnifexPayload **payload, uint32_t buffers_length
                                 1) < 0)
     {
         result = mix_result_error(env, "copy_to_payload");
+        unifex_payload_release(&payload_frame);
         goto exit_filter;
     }
 
     result = mix_result_ok(env, &payload_frame);
+    unifex_payload_release(&payload_frame);
 
 exit_filter:
     for (int i = 0; i < state->inputs_count; i++)
@@ -140,8 +142,6 @@ exit_filter:
         av_frame_free(&filtered_frame);
     if (frame != NULL)
         av_free(frame);
-    if (payload_frame != NULL)
-        unifex_payload_release(&payload_frame);
     return result;
 }
 

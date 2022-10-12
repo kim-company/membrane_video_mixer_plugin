@@ -140,6 +140,8 @@ exit_filter:
         av_frame_free(&filtered_frame);
     if (frame != NULL)
         av_free(frame);
+    if (payload_frame != NULL)
+        unifex_payload_release(&payload_frame);
     return result;
 }
 

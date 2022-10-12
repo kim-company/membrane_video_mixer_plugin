@@ -185,22 +185,22 @@ defmodule Membrane.RawVideo.MasterMixer do
   end
 
   defp mix(state = %{builder: builder, mixer: mixer}, specs_removed?) do
-    {values, state} =
+    {frames_with_spec, state} =
       Enum.map_reduce(state.queue_by_pad, state, fn {pad, queue}, state ->
         {value, queue} = FrameQueue.pop!(queue)
         {value, put_in(state, [:queue_by_pad, pad], queue)}
       end)
 
-    values = Enum.sort(values, fn %{index: left}, %{index: right} -> left < right end)
+    frames_with_spec = Enum.sort(frames_with_spec, fn %{index: left}, %{index: right} -> left < right end)
 
     specs_changed? =
-      values
+      frames_with_spec
       |> Enum.filter(fn %{spec_changed?: x} -> x end)
       |> Enum.any?()
 
     mixer =
       if specs_changed? or mixer == nil or specs_removed? do
-        specs = Enum.map(values, fn %{spec: x} -> x end)
+        specs = Enum.map(frames_with_spec, fn %{spec: x} -> x end)
         [master_spec | _] = specs
         filter = builder.(master_spec, specs)
 
@@ -211,7 +211,7 @@ defmodule Membrane.RawVideo.MasterMixer do
         mixer
       end
 
-    frames = Enum.map(values, fn %{frame: x} -> x end)
+    frames = Enum.map(frames_with_spec, fn %{frame: x} -> x end)
     [master_frame | _] = frames
     {:ok, raw_frame} = Mixer.mix(mixer, frames)
 
@@ -230,11 +230,15 @@ defmodule Membrane.RawVideo.MasterMixer do
   end
 
   defp close_frame_queue(state, pad) do
-    update_in(state, [:queue_by_pad, pad], fn
-      # Happens when end_of_stream is received before pad removed callback.
-      nil -> nil
-      queue -> FrameQueue.push(queue, :end_of_stream)
-    end)
+    case get_in(state, [:queue_by_pad, pad]) do
+      nil ->
+        # Deleted already.
+        state
+      _queue ->
+        update_in(state, [:queue_by_pad, pad], fn
+          queue -> FrameQueue.push(queue, :end_of_stream)
+        end)
+    end
   end
 
   defp build_frame_spec(pad, caps) do

@@ -179,6 +179,7 @@ defmodule Membrane.RawVideo.MasterMixer do
         mix(state, specs_removed?)
       else
         actions = Enum.map(pads_not_ready, fn _pad -> {:redemand, :output} end)
+        state = if specs_removed?, do: %{state | mixer: nil}, else: state
         {{:ok, actions}, state}
       end
     end

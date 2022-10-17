@@ -1,10 +1,10 @@
-defmodule Membrane.RawVideo.MasterMixerTest do
+defmodule Membrane.VideoMixer.MasterMixerTest do
   use ExUnit.Case
   use Membrane.Pipeline
 
   import Membrane.Testing.Assertions
   alias Membrane.Testing.Pipeline
-  alias RawVideo.FrameSpec
+  alias VideoMixer.FrameSpec
 
   # TODO: none of these tests assert the output file. It could be an idea to
   # create them with ffmpeg's executable and compare the two.
@@ -26,7 +26,7 @@ defmodule Membrane.RawVideo.MasterMixerTest do
       master: master,
       master_parser: %Membrane.H264.FFmpeg.Parser{framerate: {25, 1}},
       master_decoder: Membrane.H264.FFmpeg.Decoder,
-      mixer: %Membrane.RawVideo.MasterMixer{
+      mixer: %Membrane.VideoMixer.MasterMixer{
         filter_graph_builder: filter_builder
       },
       encoder: Membrane.H264.FFmpeg.Encoder,
@@ -71,7 +71,7 @@ defmodule Membrane.RawVideo.MasterMixerTest do
       extra_parser: %Membrane.H264.FFmpeg.Parser{framerate: {25, 1}},
       master_decoder: Membrane.H264.FFmpeg.Decoder,
       extra_decoder: Membrane.H264.FFmpeg.Decoder,
-      mixer: %Membrane.RawVideo.MasterMixer{
+      mixer: %Membrane.VideoMixer.MasterMixer{
         filter_graph_builder: filter_builder
       },
       encoder: Membrane.H264.FFmpeg.Encoder,

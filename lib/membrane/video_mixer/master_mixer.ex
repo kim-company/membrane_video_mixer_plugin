@@ -1,4 +1,4 @@
-defmodule Membrane.RawVideo.MasterMixer do
+defmodule Membrane.VideoMixer.MasterMixer do
   @moduledoc """
   Provides a Membrane.Filter that produces a video output of the same size and
   pixel properties of its master video input, mixed with other video sources
@@ -7,14 +7,15 @@ defmodule Membrane.RawVideo.MasterMixer do
 
   use Membrane.Filter
 
-  alias RawVideo.FrameSpec
-  alias RawVideo.Mixer
-  alias Membrane.RawVideo.FrameQueue
+  alias VideoMixer
+  alias VideoMixer.Frame
+  alias VideoMixer.FrameSpec
+  alias VideoMixer.FrameQueue
 
   require Logger
 
   @type filter_graph_builder_t ::
-          (output_spec :: FrameSpec.t(), inputs :: [FrameSpec.t()] -> Mixer.filter_graph_t())
+          (output_spec :: FrameSpec.t(), inputs :: [FrameSpec.t()] -> VideoMixer.filter_graph_t())
 
   def_options filter_graph_builder: [
                 spec: filter_graph_builder_t,
@@ -124,7 +125,7 @@ defmodule Membrane.RawVideo.MasterMixer do
 
   @impl true
   def handle_process(pad, buffer, _ctx, state) do
-    frame = %RawVideo.Frame{
+    frame = %Frame{
       pts: buffer.pts,
       data: buffer.payload,
       size: byte_size(buffer.payload)
@@ -204,7 +205,7 @@ defmodule Membrane.RawVideo.MasterMixer do
         [master_spec | _] = specs
         filter = builder.(master_spec, specs)
 
-        {:ok, mixer} = Mixer.init(filter, specs, master_spec)
+        {:ok, mixer} = VideoMixer.init(filter, specs, master_spec)
         mixer
       else
         mixer
@@ -212,7 +213,7 @@ defmodule Membrane.RawVideo.MasterMixer do
 
     frames = Enum.map(frames_with_spec, fn %{frame: x} -> x end)
     [master_frame | _] = frames
-    {:ok, raw_frame} = Mixer.mix(mixer, frames)
+    {:ok, raw_frame} = VideoMixer.mix(mixer, frames)
 
     buffer = %Membrane.Buffer{
       payload: raw_frame,
@@ -250,7 +251,7 @@ defmodule Membrane.RawVideo.MasterMixer do
         :master -> :master
       end
 
-    %RawVideo.FrameSpec{
+    %FrameSpec{
       reference: id,
       width: width,
       height: height,

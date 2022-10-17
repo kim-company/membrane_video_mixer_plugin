@@ -8,7 +8,6 @@ defmodule MembraneVideoMixerPlugin.MixProject do
       elixir: "~> 1.13",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      compilers: [:unifex, :bundlex] ++ Mix.compilers(),
       deps: deps()
     ]
   end
@@ -28,9 +27,7 @@ defmodule MembraneVideoMixerPlugin.MixProject do
     [
       {:membrane_core, "~> 0.10.0"},
       {:membrane_raw_video_format, "~> 0.2.0"},
-      {:bunch, "~> 1.3"},
-      {:membrane_common_c, "~> 0.13.0"},
-      {:unifex, "~> 1.0"},
+      {:video_mixer, github: "kim-company/video_mixer"},
 
       # testing
       {:membrane_file_plugin, "~> 0.12.0"},

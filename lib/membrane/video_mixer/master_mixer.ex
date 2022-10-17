@@ -159,7 +159,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
           queue_by_pad
           |> Enum.filter(fn {_pad, queue} -> FrameQueue.closed?(queue) end)
           |> Enum.reduce(queue_by_pad, fn {pad, queue}, acc ->
-            Logger.warn("Deleting closed queue: #{inspect(queue)}")
+            Logger.debug("Deleting closed queue: #{inspect(queue)}")
             Map.delete(acc, pad)
           end)
         end)

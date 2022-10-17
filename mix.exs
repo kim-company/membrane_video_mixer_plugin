@@ -1,4 +1,4 @@
-defmodule MembraneVideoMixerPlugin.MixProject do
+defmodule Membrane.VideoMixer.MixProject do
   use Mix.Project
 
   def project do

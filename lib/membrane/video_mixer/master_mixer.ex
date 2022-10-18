@@ -192,7 +192,8 @@ defmodule Membrane.VideoMixer.MasterMixer do
         {value, put_in(state, [:queue_by_pad, pad], queue)}
       end)
 
-    frames_with_spec = Enum.sort(frames_with_spec, fn %{index: left}, %{index: right} -> left < right end)
+    frames_with_spec =
+      Enum.sort(frames_with_spec, fn %{index: left}, %{index: right} -> left < right end)
 
     specs_changed? =
       frames_with_spec
@@ -234,6 +235,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
       nil ->
         # Deleted already.
         state
+
       _queue ->
         update_in(state, [:queue_by_pad, pad], fn
           queue -> FrameQueue.push(queue, :end_of_stream)
@@ -256,7 +258,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
       width: width,
       height: height,
       pixel_format: format,
-      expected_frame_size: size
+      accepted_frame_size: size
     }
   end
 end

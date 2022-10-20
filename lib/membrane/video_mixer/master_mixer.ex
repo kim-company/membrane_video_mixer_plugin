@@ -28,21 +28,18 @@ defmodule Membrane.VideoMixer.MasterMixer do
     mode: :pull,
     availability: :always,
     demand_unit: :buffers,
-    demand_mode: :auto,
     caps: Membrane.RawVideo
 
   def_input_pad :extra,
     mode: :pull,
     availability: :on_request,
     demand_unit: :buffers,
-    demand_mode: :auto,
     caps: Membrane.RawVideo
 
   def_output_pad :output,
     mode: :pull,
     availability: :always,
     demand_unit: :buffers,
-    demand_mode: :auto,
     caps: Membrane.RawVideo
 
   @impl true
@@ -113,6 +110,19 @@ defmodule Membrane.VideoMixer.MasterMixer do
     else
       {:ok, state}
     end
+  end
+
+  @impl true
+  def handle_demand(:output, requested_size, :buffers, _context, state) do
+    actions =
+      state.queue_by_pad
+      |> Enum.map(fn {pad, queue} ->
+        queue_size = FrameQueue.size(queue)
+        {:demand, {pad, max(0, requested_size - queue_size)}}
+      end)
+      |> Enum.filter(fn {:demand, {_pad, amount}} -> amount > 0 end)
+
+    {{:ok, actions}, state}
   end
 
   @impl true

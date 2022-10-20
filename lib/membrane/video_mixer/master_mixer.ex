@@ -160,21 +160,16 @@ defmodule Membrane.VideoMixer.MasterMixer do
       specs_removed? = prev_queues_count != cur_queues_count
       state = if specs_removed?, do: %{state | mixer: nil}, else: state
 
-      pads_not_ready =
+      # consider the case when a pad is removed and it was the one not ready.
+      # The other pads build a buffer and here we would consume just one.
+      repeat =
         state.queue_by_pad
-        |> Enum.filter(fn {_pad, queue} -> !FrameQueue.ready?(queue) end)
-        |> Enum.map(fn {pad, _queue} -> pad end)
+        |> Enum.map(fn {_pad, queue} -> FrameQueue.size(queue) end)
+        |> Enum.min()
 
-      ready? = length(pads_not_ready) == 0
+      ready? = repeat > 0
 
       if ready? do
-        # consider the case when a pad is removed and it was the one not ready.
-        # The other pads build a buffer and here we would consume just one.
-        repeat =
-          state.queue_by_pad
-          |> Enum.map(fn {_pad, queue} -> FrameQueue.size(queue) end)
-          |> Enum.min()
-
         {state, buffers} = mix_n(state, repeat, [])
         actions = Enum.map(buffers, fn x -> {:buffer, {:output, x}} end)
         {{:ok, actions}, state}

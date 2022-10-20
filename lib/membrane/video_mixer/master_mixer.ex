@@ -28,18 +28,21 @@ defmodule Membrane.VideoMixer.MasterMixer do
     mode: :pull,
     availability: :always,
     demand_unit: :buffers,
+    demand_mode: :auto,
     caps: Membrane.RawVideo
 
   def_input_pad :extra,
     mode: :pull,
     availability: :on_request,
     demand_unit: :buffers,
+    demand_mode: :auto,
     caps: Membrane.RawVideo
 
   def_output_pad :output,
     mode: :pull,
     availability: :always,
     demand_unit: :buffers,
+    demand_mode: :auto,
     caps: Membrane.RawVideo
 
   @impl true
@@ -113,17 +116,6 @@ defmodule Membrane.VideoMixer.MasterMixer do
   end
 
   @impl true
-  def handle_demand(:output, size, :buffers, ctx, state) do
-    actions =
-      ctx.pads
-      |> Enum.map(fn {ref, _data} -> ref end)
-      |> Enum.filter(fn ref -> Pad.name_by_ref(ref) != :output end)
-      |> Enum.map(fn ref -> {:demand, {ref, size}} end)
-
-    {{:ok, actions}, state}
-  end
-
-  @impl true
   def handle_process(pad, buffer, _ctx, state) do
     frame = %Frame{
       pts: buffer.pts,
@@ -168,7 +160,6 @@ defmodule Membrane.VideoMixer.MasterMixer do
       specs_removed? = prev_queues_count != cur_queues_count
       state = if specs_removed?, do: %{state | mixer: nil}, else: state
 
-      # redemand raw videos on pads that are not ready yet.
       pads_not_ready =
         state.queue_by_pad
         |> Enum.filter(fn {_pad, queue} -> !FrameQueue.ready?(queue) end)
@@ -177,12 +168,27 @@ defmodule Membrane.VideoMixer.MasterMixer do
       ready? = length(pads_not_ready) == 0
 
       if ready? do
-        mix(state)
-      else
-        actions = Enum.map(pads_not_ready, fn _pad -> {:redemand, :output} end)
+        # consider the case when a pad is removed and it was the one not ready.
+        # The other pads build a buffer and here we would consume just one.
+        repeat =
+          state.queue_by_pad
+          |> Enum.map(fn {_pad, queue} -> FrameQueue.size(queue) end)
+          |> Enum.min()
+
+        {state, buffers} = mix_n(state, repeat, [])
+        actions = Enum.map(buffers, fn x -> {:buffer, {:output, x}} end)
         {{:ok, actions}, state}
+      else
+        # wait for the next frame
+        {:ok, state}
       end
     end
+  end
+
+  defp mix_n(state, 0, acc), do: {state, Enum.reverse(acc)}
+  defp mix_n(state, n, acc) do
+    {state, buffer} = mix(state)
+    mix_n(state, n - 1, [buffer | acc])
   end
 
   defp mix(state = %{builder: builder, mixer: mixer}) do
@@ -221,7 +227,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
       pts: master_frame.pts
     }
 
-    {{:ok, [buffer: {:output, buffer}]}, %{state | mixer: mixer}}
+    {%{state | mixer: mixer}, buffer}
   end
 
   defp init_frame_queue(state = %{next_queue_index: index}, pad) do

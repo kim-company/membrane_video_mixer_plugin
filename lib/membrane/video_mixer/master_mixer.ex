@@ -186,6 +186,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
   end
 
   defp mix_n(state, 0, acc), do: {state, Enum.reverse(acc)}
+
   defp mix_n(state, n, acc) do
     {state, buffer} = mix(state)
     mix_n(state, n - 1, [buffer | acc])

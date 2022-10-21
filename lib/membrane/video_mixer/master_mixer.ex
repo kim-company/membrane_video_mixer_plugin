@@ -118,7 +118,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
       state.queue_by_pad
       |> Enum.reject(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
       |> Enum.map(fn {pad, _queue} -> {:demand, {pad, 1}} end)
-      |> IO.inspect("VMIX Demand actions")
+      |> IO.inspect(label: "VMIX Demand actions")
 
     {{:ok, actions}, state}
   end

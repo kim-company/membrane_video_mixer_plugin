@@ -113,14 +113,11 @@ defmodule Membrane.VideoMixer.MasterMixer do
   end
 
   @impl true
-  def handle_demand(:output, requested_size, :buffers, _context, state) do
+  def handle_demand(:output, _size, :buffers, _context, state) do
     actions =
       state.queue_by_pad
-      |> Enum.map(fn {pad, queue} ->
-        queue_size = FrameQueue.size(queue)
-        {:demand, {pad, max(0, requested_size - queue_size)}}
-      end)
-      |> Enum.filter(fn {:demand, {_pad, amount}} -> amount > 0 end)
+      |> Enum.reject(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
+      |> Enum.map(fn {pad, _queue} -> {:demand, {pad, 1}} end)
 
     {{:ok, actions}, state}
   end
@@ -182,7 +179,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
       if ready? do
         {state, buffers} = mix_n(state, repeat, [])
         actions = Enum.map(buffers, fn x -> {:buffer, {:output, x}} end)
-        {{:ok, actions}, state}
+        {{:ok, actions ++ [redemand: :output]}, state}
       else
         # wait for the next frame
         {:ok, state}

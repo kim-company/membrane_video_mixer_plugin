@@ -19,7 +19,8 @@ defmodule Membrane.VideoMixer.MasterMixerTest do
     out_path = Path.join([tmp_dir, "output.h264"])
 
     filter_builder = fn %FrameSpec{width: w, height: h}, _inputs ->
-      {"[0:v]scale=#{w}:#{h}:force_original_aspect_ratio=decrease,pad=#{w}:#{h}:-1:-1,setsar=1", [0]}
+      {"[0:v]scale=#{w}:#{h}:force_original_aspect_ratio=decrease,pad=#{w}:#{h}:-1:-1,setsar=1",
+       [0]}
     end
 
     children = [
@@ -61,7 +62,8 @@ defmodule Membrane.VideoMixer.MasterMixerTest do
 
     filter_builder = fn %FrameSpec{width: width, height: height}, inputs
                         when length(inputs) == 2 ->
-      {"[0:v]scale=#{width}/2:#{height}:force_original_aspect_ratio=decrease,pad=#{width}/2+1:#{height}:-1:-1,setsar=1[l];[1:v]scale=-1:#{height}/2,crop=#{width}/2:ih:iw/2:0,pad=#{width}/2:#{height}:-1:-1,setsar=1[r];[l][r]hstack", [0, 1]}
+      {"[0:v]scale=#{width}/2:#{height}:force_original_aspect_ratio=decrease,pad=#{width}/2+1:#{height}:-1:-1,setsar=1[l];[1:v]scale=-1:#{height}/2,crop=#{width}/2:ih:iw/2:0,pad=#{width}/2:#{height}:-1:-1,setsar=1[r];[l][r]hstack",
+       [0, 1]}
     end
 
     children = [

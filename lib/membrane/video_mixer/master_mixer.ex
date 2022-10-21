@@ -116,7 +116,9 @@ defmodule Membrane.VideoMixer.MasterMixer do
   def handle_demand(:output, _size, :buffers, _context, state) do
     actions =
       state.queue_by_pad
-      |> Enum.reject(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
+      |> Enum.reject(fn {_pad, queue} ->
+        FrameQueue.ready?(queue) or FrameQueue.closed?(queue)
+      end)
       |> Enum.map(fn {pad, _queue} -> {:demand, {pad, 1}} end)
 
     {{:ok, actions}, state}

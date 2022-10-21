@@ -118,7 +118,6 @@ defmodule Membrane.VideoMixer.MasterMixer do
       state.queue_by_pad
       |> Enum.reject(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
       |> Enum.map(fn {pad, _queue} -> {:demand, {pad, 1}} end)
-      |> IO.inspect(label: "VMIX Demand actions")
 
     {{:ok, actions}, state}
   end
@@ -170,19 +169,13 @@ defmodule Membrane.VideoMixer.MasterMixer do
 
       # consider the case when a pad is removed and it was the one not ready.
       # The other pads build a buffer and here we would consume just one.
-      repeat =
+      ready_frames =
         state.queue_by_pad
         |> Enum.map(fn {_pad, queue} -> FrameQueue.size(queue) end)
         |> Enum.min()
 
-      ready? =
-        IO.inspect(
-          repeat > 0,
-          label: "VMIX number of ready queues"
-        )
-
-      if ready? do
-        {state, buffers} = mix_n(state, repeat, [])
+      if ready_frames > 0 do
+        {state, buffers} = mix_n(state, ready_frames, [])
         actions = Enum.map(buffers, fn x -> {:buffer, {:output, x}} end)
         {{:ok, actions ++ [redemand: :output]}, state}
       else

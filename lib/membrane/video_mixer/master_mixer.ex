@@ -118,6 +118,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
       state.queue_by_pad
       |> Enum.reject(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
       |> Enum.map(fn {pad, _queue} -> {:demand, {pad, 1}} end)
+      |> IO.inspect("VMIX Demand actions")
 
     {{:ok, actions}, state}
   end
@@ -174,7 +175,11 @@ defmodule Membrane.VideoMixer.MasterMixer do
         |> Enum.map(fn {_pad, queue} -> FrameQueue.size(queue) end)
         |> Enum.min()
 
-      ready? = repeat > 0
+      ready? =
+        IO.inspect(
+          repeat > 0,
+          label: "VMIX number of ready queues"
+        )
 
       if ready? do
         {state, buffers} = mix_n(state, repeat, [])

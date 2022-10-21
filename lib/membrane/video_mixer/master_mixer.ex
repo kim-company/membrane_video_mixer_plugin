@@ -59,7 +59,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
 
   @impl true
   def handle_pad_added(pad, _ctx, state) do
-    {:ok, init_frame_queue(state, pad)}
+    {{:ok, demand: {pad, 1}}, init_frame_queue(state, pad)}
   end
 
   @impl true

@@ -58,8 +58,23 @@ defmodule Membrane.VideoMixer.MasterMixer do
   end
 
   @impl true
-  def handle_pad_added(pad, _ctx, state) do
-    {{:ok, demand: {pad, 1}}, init_frame_queue(state, pad)}
+  def handle_prepared_to_playing(_ctx, state) do
+    actions =
+      state.queue_by_pad
+      |> Map.keys()
+      |> Enum.map(fn pad -> {:demand, {pad, 1}} end)
+
+    {{:ok, actions}, state}
+  end
+
+  @impl true
+  def handle_pad_added(pad, ctx, state) do
+    actions =
+      if ctx.playback_state == :playing,
+        do: [demand: {pad, 1}],
+        else: []
+
+    {{:ok, actions}, init_frame_queue(state, pad)}
   end
 
   @impl true
@@ -116,8 +131,11 @@ defmodule Membrane.VideoMixer.MasterMixer do
   def handle_demand(:output, _size, :buffers, _context, state) do
     actions =
       state.queue_by_pad
+      |> Enum.filter(fn {_pad, queue} ->
+        FrameQueue.ready?(queue)
+      end)
       |> Enum.reject(fn {_pad, queue} ->
-        FrameQueue.ready?(queue) or FrameQueue.closed?(queue)
+        FrameQueue.any?(queue) or FrameQueue.closed?(queue)
       end)
       |> Enum.map(fn {pad, _queue} -> {:demand, {pad, 1}} end)
 
@@ -126,15 +144,19 @@ defmodule Membrane.VideoMixer.MasterMixer do
 
   @impl true
   def handle_process(pad, buffer, _ctx, state) do
-    frame = %Frame{
-      pts: buffer.pts,
-      data: buffer.payload,
-      size: byte_size(buffer.payload)
-    }
+    if master_closed?(state) do
+      {:ok, state}
+    else
+      frame = %Frame{
+        pts: buffer.pts,
+        data: buffer.payload,
+        size: byte_size(buffer.payload)
+      }
 
-    state
-    |> update_in([:queue_by_pad, pad], fn queue -> FrameQueue.push(queue, frame) end)
-    |> mix_if_ready()
+      state
+      |> update_in([:queue_by_pad, pad], fn queue -> FrameQueue.push(queue, frame) end)
+      |> mix_if_ready()
+    end
   end
 
   @impl true
@@ -142,14 +164,15 @@ defmodule Membrane.VideoMixer.MasterMixer do
     {:ok, %{state | mixer: nil}}
   end
 
+  defp master_closed?(state) do
+    state
+    |> get_in([:queue_by_pad, :master])
+    |> FrameQueue.closed?()
+  end
+
   defp mix_if_ready(state) do
     # Handle closed queues first. If the master one is done, that's it.
-    master_closed? =
-      state
-      |> get_in([:queue_by_pad, :master])
-      |> FrameQueue.closed?()
-
-    if master_closed? do
+    if master_closed?(state) do
       {{:ok, [end_of_stream: :output]}, state}
     else
       # delete all inputs that are now closed.
@@ -173,13 +196,13 @@ defmodule Membrane.VideoMixer.MasterMixer do
       # The other pads build a buffer and here we would consume just one.
       ready_frames =
         state.queue_by_pad
+        |> Enum.filter(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
         |> Enum.map(fn {_pad, queue} -> FrameQueue.size(queue) end)
         |> Enum.min()
 
       if ready_frames > 0 do
         {state, buffers} = mix_n(state, ready_frames, [])
-        actions = Enum.map(buffers, fn x -> {:buffer, {:output, x}} end)
-        {{:ok, actions ++ [redemand: :output]}, state}
+        {{:ok, [buffer: {:output, buffers}, redemand: :output]}, state}
       else
         # wait for the next frame
         {:ok, state}
@@ -196,7 +219,9 @@ defmodule Membrane.VideoMixer.MasterMixer do
 
   defp mix(state = %{builder: builder, mixer: mixer}) do
     {frames_with_spec, state} =
-      Enum.map_reduce(state.queue_by_pad, state, fn {pad, queue}, state ->
+      state.queue_by_pad
+      |> Enum.filter(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
+      |> Enum.map_reduce(state, fn {pad, queue}, state ->
         {value, queue} = FrameQueue.pop!(queue)
         {value, put_in(state, [:queue_by_pad, pad], queue)}
       end)

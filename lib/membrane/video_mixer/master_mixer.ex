@@ -15,7 +15,8 @@ defmodule Membrane.VideoMixer.MasterMixer do
   require Logger
 
   @type filter_graph_builder_t ::
-          (output_spec :: FrameSpec.t(), inputs :: [FrameSpec.t()] -> VideoMixer.filter_graph_t())
+          (output_spec :: FrameSpec.t(), inputs :: [FrameSpec.t()], builder_state :: any ->
+             VideoMixer.filter_graph_t())
 
   def_options filter_graph_builder: [
                 spec: filter_graph_builder_t,
@@ -46,6 +47,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
   def handle_init(%__MODULE__{filter_graph_builder: builder}) do
     state = %{
       builder: builder,
+      builder_state: nil,
       mixer: nil,
       framerate: nil,
       next_queue_index: 0,
@@ -160,8 +162,8 @@ defmodule Membrane.VideoMixer.MasterMixer do
   end
 
   @impl true
-  def handle_other(:rebuild_filter_graph, _ctx, state) do
-    {:ok, %{state | mixer: nil}}
+  def handle_other({:rebuild_filter_graph, builder_state}, _ctx, state) do
+    {:ok, %{state | mixer: nil, builder_state: builder_state}}
   end
 
   defp master_closed?(state) do
@@ -238,7 +240,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
       if specs_changed? or mixer == nil do
         specs = Enum.map(frames_with_spec, fn %{spec: x} -> x end)
         [master_spec | _] = specs
-        filter = builder.(master_spec, specs)
+        filter = builder.(master_spec, specs, state.builder_state)
 
         {:ok, mixer} = VideoMixer.init(filter, specs, master_spec)
         mixer

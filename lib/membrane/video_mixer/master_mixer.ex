@@ -133,9 +133,9 @@ defmodule Membrane.VideoMixer.MasterMixer do
   def handle_demand(:output, _size, :buffers, _context, state) do
     actions =
       state.queue_by_pad
-      |> Enum.filter(fn {_pad, queue} ->
-        FrameQueue.ready?(queue)
-      end)
+      # |> Enum.filter(fn {_pad, queue} ->
+      #   FrameQueue.ready?(queue)
+      # end)
       |> Enum.reject(fn {_pad, queue} ->
         FrameQueue.any?(queue) or FrameQueue.closed?(queue)
       end)
@@ -198,7 +198,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
       # The other pads build a buffer and here we would consume just one.
       ready_frames =
         state.queue_by_pad
-        |> Enum.filter(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
+        # |> Enum.filter(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
         |> Enum.map(fn {_pad, queue} -> FrameQueue.size(queue) end)
         |> Enum.min()
 
@@ -222,7 +222,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
   defp mix(state = %{builder: builder, mixer: mixer}) do
     {frames_with_spec, state} =
       state.queue_by_pad
-      |> Enum.filter(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
+      # |> Enum.filter(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
       |> Enum.map_reduce(state, fn {pad, queue}, state ->
         {value, queue} = FrameQueue.pop!(queue)
         {value, put_in(state, [:queue_by_pad, pad], queue)}

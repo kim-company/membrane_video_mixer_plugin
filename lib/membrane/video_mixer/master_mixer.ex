@@ -23,6 +23,13 @@ defmodule Membrane.VideoMixer.MasterMixer do
                 description: """
                 Provides a filter graph specification given the input and output frame specifications.
                 """
+              ],
+              builder_state: [
+                spec: any(),
+                default: nil,
+                description: """
+                Initial state for the filter graph builder.
+                """
               ]
 
   def_input_pad :master,
@@ -44,10 +51,10 @@ defmodule Membrane.VideoMixer.MasterMixer do
     caps: Membrane.RawVideo
 
   @impl true
-  def handle_init(%__MODULE__{filter_graph_builder: builder}) do
+  def handle_init(opts) do
     state = %{
-      builder: builder,
-      builder_state: nil,
+      builder: opts.filter_graph_builder,
+      builder_state: opts.builder_state,
       mixer: nil,
       framerate: nil,
       next_queue_index: 0,

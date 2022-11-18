@@ -8,7 +8,7 @@ This element is used in production.
 ```elixir
 def deps do
   [
-    {:membrane_video_mixer_plugin, github: "kim-company/membrane_video_mixer_plugin"}
+    {:membrane_video_mixer_plugin, "~> 1.0.0"}
   ]
 end
 ```

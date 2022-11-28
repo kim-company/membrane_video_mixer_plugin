@@ -274,7 +274,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
 
   defp init_frame_queue(state = %{next_queue_index: index}, pad) do
     state
-    |> put_in([:queue_by_pad, pad], FrameQueue.new(index))
+    |> put_in([:queue_by_pad, pad], FrameQueue.new(index, pad == :master))
     |> put_in([:next_queue_index], index + 1)
   end
 

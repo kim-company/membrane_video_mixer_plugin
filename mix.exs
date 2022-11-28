@@ -33,7 +33,7 @@ defmodule Membrane.VideoMixer.MixProject do
     [
       {:membrane_core, "~> 0.10.0"},
       {:membrane_raw_video_format, "~> 0.2.0"},
-      {:video_mixer, "~> 1.0.0"},
+      {:video_mixer, github: "kim-company/video_mixer", branch: "block-master"},
 
       # testing
       {:membrane_file_plugin, "~> 0.12.0"},
@@ -41,7 +41,7 @@ defmodule Membrane.VideoMixer.MixProject do
       {:membrane_framerate_converter_plugin, "~> 0.5.0"}
     ]
   end
-  
+
   defp package do
     [
       maintainers: ["KIM Keep In Mind"],

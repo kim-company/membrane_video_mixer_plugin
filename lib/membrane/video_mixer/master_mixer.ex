@@ -169,6 +169,11 @@ defmodule Membrane.VideoMixer.MasterMixer do
   end
 
   @impl true
+  def handle_other(:rebuild_filter_graph, _ctx, state) do
+    {:ok, %{state | mixer: nil}}
+  end
+
+  @impl true
   def handle_other({:rebuild_filter_graph, builder_state}, _ctx, state) do
     {:ok, %{state | mixer: nil, builder_state: builder_state}}
   end

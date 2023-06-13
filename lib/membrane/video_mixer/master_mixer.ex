@@ -36,22 +36,21 @@ defmodule Membrane.VideoMixer.MasterMixer do
     mode: :pull,
     availability: :always,
     demand_unit: :buffers,
-    caps: Membrane.RawVideo
+    accepted_format: Membrane.RawVideo
 
   def_input_pad :extra,
     mode: :pull,
     availability: :on_request,
     demand_unit: :buffers,
-    caps: Membrane.RawVideo
+    accepted_format: Membrane.RawVideo
 
   def_output_pad :output,
     mode: :pull,
     availability: :always,
-    demand_unit: :buffers,
-    caps: Membrane.RawVideo
+    accepted_format: Membrane.RawVideo
 
   @impl true
-  def handle_init(opts) do
+  def handle_init(_ctx, opts) do
     state = %{
       builder: opts.filter_graph_builder,
       builder_state: opts.builder_state,
@@ -63,27 +62,27 @@ defmodule Membrane.VideoMixer.MasterMixer do
 
     state = init_frame_queue(state, :master)
 
-    {:ok, state}
+    {[], state}
   end
 
   @impl true
-  def handle_prepared_to_playing(_ctx, state) do
+  def handle_playing(_ctx, state) do
     actions =
       state.queue_by_pad
       |> Map.keys()
       |> Enum.map(fn pad -> {:demand, {pad, 1}} end)
 
-    {{:ok, actions}, state}
+    {actions, state}
   end
 
   @impl true
   def handle_pad_added(pad, ctx, state) do
     actions =
-      if ctx.playback_state == :playing,
+      if ctx.playback == :playing,
         do: [demand: {pad, 1}],
         else: []
 
-    {{:ok, actions}, init_frame_queue(state, pad)}
+    {actions, init_frame_queue(state, pad)}
   end
 
   @impl true
@@ -99,27 +98,25 @@ defmodule Membrane.VideoMixer.MasterMixer do
   end
 
   @impl true
-  def handle_caps(_pad, %Membrane.RawVideo{framerate: nil}, _ctx, state) do
-    {{:error, "mixer inputs must provide a framerate"}, state}
+  def handle_stream_format(_pad, %Membrane.RawVideo{framerate: nil}, _ctx, _state) do
+    raise "mixer inputs must provide a framerate"
   end
 
-  def handle_caps(_pad, %Membrane.RawVideo{framerate: {0, 1}}, _ctx, state) do
-    {{:error, "mixer inputs must provide a stable framerate"}, state}
+  def handle_stream_format(_pad, %Membrane.RawVideo{framerate: {0, 1}}, _ctx, _state) do
+    raise "mixer inputs must provide a stable framerate"
   end
 
-  def handle_caps(
+  def handle_stream_format(
         _pad,
         %Membrane.RawVideo{framerate: framerate},
         _ctx,
-        state = %{framerate: target_framerate}
+        %{framerate: target_framerate}
       )
       when framerate != target_framerate and target_framerate != nil do
-    {{:error,
-      "all mixer inputs must agree on framerate. Have #{inspect(framerate)}, want #{inspect(target_framerate)}"},
-     state}
+    raise "all mixer inputs must agree on framerate. Have #{inspect(framerate)}, want #{inspect(target_framerate)}"
   end
 
-  def handle_caps(pad, caps = %Membrane.RawVideo{framerate: framerate}, _ctx, state) do
+  def handle_stream_format(pad, caps = %Membrane.RawVideo{framerate: framerate}, _ctx, state) do
     frame_spec = build_frame_spec(pad, caps)
 
     state =
@@ -130,9 +127,9 @@ defmodule Membrane.VideoMixer.MasterMixer do
       end)
 
     if pad == :master do
-      {{:ok, [forward: caps]}, state}
+      {[stream_format: {:output, caps}], state}
     else
-      {:ok, state}
+      {[], state}
     end
   end
 
@@ -148,13 +145,13 @@ defmodule Membrane.VideoMixer.MasterMixer do
       end)
       |> Enum.map(fn {pad, _queue} -> {:demand, {pad, 1}} end)
 
-    {{:ok, actions}, state}
+    {actions, state}
   end
 
   @impl true
   def handle_process(pad, buffer, _ctx, state) do
     if master_closed?(state) do
-      {:ok, state}
+      {[], state}
     else
       frame = %Frame{
         pts: buffer.pts,
@@ -169,13 +166,13 @@ defmodule Membrane.VideoMixer.MasterMixer do
   end
 
   @impl true
-  def handle_other(:rebuild_filter_graph, _ctx, state) do
-    {:ok, %{state | mixer: nil}}
+  def handle_info(:rebuild_filter_graph, _ctx, state) do
+    {[], %{state | mixer: nil}}
   end
 
   @impl true
-  def handle_other({:rebuild_filter_graph, builder_state}, _ctx, state) do
-    {:ok, %{state | mixer: nil, builder_state: builder_state}}
+  def handle_info({:rebuild_filter_graph, builder_state}, _ctx, state) do
+    {[], %{state | mixer: nil, builder_state: builder_state}}
   end
 
   defp master_closed?(state) do
@@ -187,7 +184,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
   defp mix_if_ready(state) do
     # Handle closed queues first. If the master one is done, that's it.
     if master_closed?(state) do
-      {{:ok, [end_of_stream: :output]}, state}
+      {[end_of_stream: :output], state}
     else
       # delete all inputs that are now closed.
       prev_queues_count = map_size(state.queue_by_pad)
@@ -216,10 +213,10 @@ defmodule Membrane.VideoMixer.MasterMixer do
 
       if ready_frames > 0 do
         {state, buffers} = mix_n(state, ready_frames, [])
-        {{:ok, [buffer: {:output, buffers}, redemand: :output]}, state}
+        {[buffer: {:output, buffers}, redemand: :output], state}
       else
         # wait for the next frame
-        {:ok, state}
+        {[], state}
       end
     end
   end

@@ -31,17 +31,17 @@ defmodule Membrane.VideoMixer.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:membrane_core, "~> 0.10.0"},
-      {:membrane_raw_video_format, "~> 0.2.0"},
+      {:membrane_core, ">= 0.11.0"},
+      {:membrane_raw_video_format, ">= 0.2.0"},
       {:video_mixer, "~> 1.0.0"},
 
       # testing
-      {:membrane_file_plugin, "~> 0.12.0"},
-      {:membrane_h264_ffmpeg_plugin, "~> 0.21.5"},
-      {:membrane_framerate_converter_plugin, "~> 0.5.0"}
+      {:membrane_file_plugin, ">= 0.0.0"},
+      {:membrane_h264_ffmpeg_plugin, ">= 0.0.0"},
+      {:membrane_framerate_converter_plugin, ">= 0.5.0"}
     ]
   end
-  
+
   defp package do
     [
       maintainers: ["KIM Keep In Mind"],

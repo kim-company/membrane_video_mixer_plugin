@@ -18,36 +18,41 @@ defmodule Membrane.VideoMixer.MasterMixer do
           (output_spec :: FrameSpec.t(), inputs :: [FrameSpec.t()], builder_state :: any ->
              VideoMixer.filter_graph_t())
 
-  def_options filter_graph_builder: [
-                spec: filter_graph_builder_t,
-                description: """
-                Provides a filter graph specification given the input and output frame specifications.
-                """
-              ],
-              builder_state: [
-                spec: any(),
-                default: nil,
-                description: """
-                Initial state for the filter graph builder.
-                """
-              ]
+  def_options(
+    filter_graph_builder: [
+      spec: filter_graph_builder_t,
+      description: """
+      Provides a filter graph specification given the input and output frame specifications.
+      """
+    ],
+    builder_state: [
+      spec: any(),
+      default: nil,
+      description: """
+      Initial state for the filter graph builder.
+      """
+    ]
+  )
 
-  def_input_pad :master,
+  def_input_pad(:master,
     mode: :pull,
     availability: :always,
     demand_unit: :buffers,
     accepted_format: Membrane.RawVideo
+  )
 
-  def_input_pad :extra,
+  def_input_pad(:extra,
     mode: :pull,
     availability: :on_request,
     demand_unit: :buffers,
     accepted_format: Membrane.RawVideo
+  )
 
-  def_output_pad :output,
+  def_output_pad(:output,
     mode: :pull,
     availability: :always,
     accepted_format: Membrane.RawVideo
+  )
 
   @impl true
   def handle_init(_ctx, opts) do
@@ -57,7 +62,8 @@ defmodule Membrane.VideoMixer.MasterMixer do
       mixer: nil,
       framerate: nil,
       next_queue_index: 0,
-      queue_by_pad: %{}
+      queue_by_pad: %{},
+      closed?: false
     }
 
     state = init_frame_queue(state, :master)
@@ -183,8 +189,8 @@ defmodule Membrane.VideoMixer.MasterMixer do
 
   defp mix_if_ready(state) do
     # Handle closed queues first. If the master one is done, that's it.
-    if master_closed?(state) do
-      {[end_of_stream: :output], state}
+    if master_closed?(state) and not state.closed? do
+      {[end_of_stream: :output], %{state | closed?: true}}
     else
       # delete all inputs that are now closed.
       prev_queues_count = map_size(state.queue_by_pad)
@@ -205,18 +211,18 @@ defmodule Membrane.VideoMixer.MasterMixer do
 
       # consider the case when a pad is removed and it was the one not ready.
       # The other pads build a buffer and here we would consume just one.
-      ready_frames =
+      frame_sizes =
         state.queue_by_pad
         |> Enum.filter(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
         |> Enum.map(fn {_pad, queue} -> FrameQueue.size(queue) end)
-        |> Enum.min()
 
-      if ready_frames > 0 do
-        {state, buffers} = mix_n(state, ready_frames, [])
-        {[buffer: {:output, buffers}, redemand: :output], state}
-      else
+      if frame_sizes == [] or Enum.min(frame_sizes) == 0 do
         # wait for the next frame
         {[], state}
+      else
+        ready_frames = Enum.min(frame_sizes)
+        {state, buffers} = mix_n(state, ready_frames, [])
+        {[buffer: {:output, buffers}, redemand: :output], state}
       end
     end
   end

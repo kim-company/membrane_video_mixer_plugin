@@ -172,12 +172,11 @@ defmodule Membrane.VideoMixer.MasterMixer do
   end
 
   @impl true
-  def handle_info(:rebuild_filter_graph, _ctx, state) do
+  def handle_parent_notification(:rebuild_filter_graph, _ctx, state) do
     {[], %{state | mixer: nil}}
   end
 
-  @impl true
-  def handle_info({:rebuild_filter_graph, builder_state}, _ctx, state) do
+  def handle_parent_notification({:rebuild_filter_graph, builder_state}, _ctx, state) do
     {[], %{state | mixer: nil, builder_state: builder_state}}
   end
 

@@ -12,7 +12,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
   alias VideoMixer.FrameSpec
   alias VideoMixer.FrameQueue
 
-  require Logger
+  require Membrane.Logger
 
   @type filter_graph_builder_t ::
           (output_spec :: FrameSpec.t(), inputs :: [FrameSpec.t()], builder_state :: any ->
@@ -199,7 +199,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
           queue_by_pad
           |> Enum.filter(fn {_pad, queue} -> FrameQueue.closed?(queue) end)
           |> Enum.reduce(queue_by_pad, fn {pad, queue}, acc ->
-            Logger.debug("Deleting closed queue: #{inspect(queue)}")
+            Membrane.Logger.debug("Deleting closed queue: #{inspect(queue)}")
             Map.delete(acc, pad)
           end)
         end)

@@ -1,0 +1,7 @@
+[tools]
+elixir = "1.19.4-otp-28"
+erlang = "28.2"
+ffmpeg = "8.0.1"
+
+[env]
+_.source = { path = "scripts/mise-env.sh", tools = true }

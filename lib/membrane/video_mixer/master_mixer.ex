@@ -35,22 +35,23 @@ defmodule Membrane.VideoMixer.MasterMixer do
   )
 
   def_input_pad(:master,
-    mode: :pull,
+    flow_control: :manual,
     availability: :always,
     demand_unit: :buffers,
     accepted_format: Membrane.RawVideo
   )
 
   def_input_pad(:extra,
-    mode: :pull,
+    flow_control: :manual,
     availability: :on_request,
     demand_unit: :buffers,
     accepted_format: Membrane.RawVideo
   )
 
   def_output_pad(:output,
-    mode: :pull,
+    flow_control: :manual,
     availability: :always,
+    demand_unit: :buffers,
     accepted_format: Membrane.RawVideo
   )
 
@@ -61,8 +62,8 @@ defmodule Membrane.VideoMixer.MasterMixer do
       builder_state: opts.builder_state,
       mixer: nil,
       framerate: nil,
-      next_queue_index: 0,
       queue_by_pad: %{},
+      pad_order: [],
       closed?: false
     }
 
@@ -155,7 +156,7 @@ defmodule Membrane.VideoMixer.MasterMixer do
   end
 
   @impl true
-  def handle_process(pad, buffer, _ctx, state) do
+  def handle_buffer(pad, buffer, _ctx, state) do
     if master_closed?(state) do
       {[], state}
     else
@@ -195,7 +196,8 @@ defmodule Membrane.VideoMixer.MasterMixer do
       prev_queues_count = map_size(state.queue_by_pad)
 
       state =
-        update_in(state, [:queue_by_pad], fn queue_by_pad ->
+        state
+        |> update_in([:queue_by_pad], fn queue_by_pad ->
           queue_by_pad
           |> Enum.filter(fn {_pad, queue} -> FrameQueue.closed?(queue) end)
           |> Enum.reduce(queue_by_pad, fn {pad, queue}, acc ->
@@ -203,25 +205,37 @@ defmodule Membrane.VideoMixer.MasterMixer do
             Map.delete(acc, pad)
           end)
         end)
+        |> then(fn state ->
+          update_in(state, [:pad_order], fn pad_order ->
+            Enum.filter(pad_order, &Map.has_key?(state.queue_by_pad, &1))
+          end)
+        end)
 
       cur_queues_count = map_size(state.queue_by_pad)
       specs_removed? = prev_queues_count != cur_queues_count
       state = if specs_removed?, do: %{state | mixer: nil}, else: state
 
-      # consider the case when a pad is removed and it was the one not ready.
-      # The other pads build a buffer and here we would consume just one.
-      frame_sizes =
-        state.queue_by_pad
-        |> Enum.filter(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
-        |> Enum.map(fn {_pad, queue} -> FrameQueue.size(queue) end)
+      all_ready? =
+        Enum.all?(state.queue_by_pad, fn {_pad, queue} -> FrameQueue.ready?(queue) end)
 
-      if frame_sizes == [] or Enum.min(frame_sizes) == 0 do
-        # wait for the next frame
+      if not all_ready? do
         {[], state}
       else
-        ready_frames = Enum.min(frame_sizes)
-        {state, buffers} = mix_n(state, ready_frames, [])
-        {[buffer: {:output, buffers}, redemand: :output], state}
+        # consider the case when a pad is removed and it was the one not ready.
+        # The other pads build a buffer and here we would consume just one.
+        frame_sizes =
+          state.queue_by_pad
+          |> Enum.filter(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
+          |> Enum.map(fn {_pad, queue} -> FrameQueue.size(queue) end)
+
+        if frame_sizes == [] or Enum.min(frame_sizes) == 0 do
+          # wait for the next frame
+          {[], state}
+        else
+          ready_frames = Enum.min(frame_sizes)
+          {state, buffers} = mix_n(state, ready_frames, [])
+          {[buffer: {:output, buffers}, redemand: :output], state}
+        end
       end
     end
   end
@@ -235,28 +249,28 @@ defmodule Membrane.VideoMixer.MasterMixer do
 
   defp mix(state = %{builder: builder, mixer: mixer}) do
     {frames_with_spec, state} =
-      state.queue_by_pad
-      |> Enum.filter(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
-      |> Enum.map_reduce(state, fn {pad, queue}, state ->
-        {value, queue} = FrameQueue.pop!(queue)
+      state.pad_order
+      |> Enum.filter(&Map.has_key?(state.queue_by_pad, &1))
+      |> Enum.filter(fn pad -> FrameQueue.ready?(state.queue_by_pad[pad]) end)
+      |> Enum.map_reduce(state, fn pad, state ->
+        {value, queue} = FrameQueue.pop!(state.queue_by_pad[pad])
         {value, put_in(state, [:queue_by_pad, pad], queue)}
       end)
-
-    frames_with_spec =
-      Enum.sort(frames_with_spec, fn %{index: left}, %{index: right} -> left < right end)
 
     specs_changed? =
       frames_with_spec
       |> Enum.filter(fn %{spec_changed?: x} -> x end)
       |> Enum.any?()
 
+    input_order = input_order(state)
+
     mixer =
       if specs_changed? or mixer == nil do
         specs = Enum.map(frames_with_spec, fn %{spec: x} -> x end)
         [master_spec | _] = specs
-        filter = builder.(master_spec, specs, state.builder_state)
+        filter_graph = builder.(master_spec, specs, state.builder_state)
 
-        {:ok, mixer} = VideoMixer.init(filter, specs, master_spec)
+        {:ok, mixer} = VideoMixer.init_raw(filter_graph, specs, input_order, master_spec)
         mixer
       else
         mixer
@@ -264,7 +278,8 @@ defmodule Membrane.VideoMixer.MasterMixer do
 
     frames = Enum.map(frames_with_spec, fn %{frame: x} -> x end)
     [master_frame | _] = frames
-    {:ok, raw_frame} = VideoMixer.mix(mixer, frames)
+    frames_by_name = Enum.zip(input_order, frames)
+    {:ok, raw_frame} = VideoMixer.mix(mixer, frames_by_name)
 
     buffer = %Membrane.Buffer{
       payload: raw_frame,
@@ -274,10 +289,10 @@ defmodule Membrane.VideoMixer.MasterMixer do
     {%{state | mixer: mixer}, buffer}
   end
 
-  defp init_frame_queue(state = %{next_queue_index: index}, pad) do
+  defp init_frame_queue(state, pad) do
     state
-    |> put_in([:queue_by_pad, pad], FrameQueue.new(index))
-    |> put_in([:next_queue_index], index + 1)
+    |> put_in([:queue_by_pad, pad], FrameQueue.new())
+    |> update_in([:pad_order], fn pad_order -> pad_order ++ [pad] end)
   end
 
   defp close_frame_queue(state, pad) do
@@ -292,6 +307,15 @@ defmodule Membrane.VideoMixer.MasterMixer do
         end)
     end
   end
+
+  defp input_order(state) do
+    state.pad_order
+    |> Enum.filter(&Map.has_key?(state.queue_by_pad, &1))
+    |> Enum.map(&pad_input_name/1)
+  end
+
+  defp pad_input_name(:master), do: :master
+  defp pad_input_name({Membrane.Pad, :extra, id}), do: :"extra_#{id}"
 
   defp build_frame_spec(pad, caps) do
     %Membrane.RawVideo{width: width, height: height, pixel_format: format} = caps

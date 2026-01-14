@@ -1,4 +1,4 @@
-defmodule Membrane.VideoMixer.MasterMixerTest do
+defmodule Membrane.VideoMixer.FilterTest do
   use ExUnit.Case
 
   import Membrane.ChildrenSpec
@@ -17,15 +17,15 @@ defmodule Membrane.VideoMixer.MasterMixerTest do
     format = FrameGenerator.stream_format(width, height, framerate: {30, 1}, pixel_format: :I420)
     {generator_state, generator} = FrameGenerator.red_generator(format)
 
-    filter_builder = fn _output_spec, _inputs, _builder_state ->
-      {"[0:v]null[out]", [0]}
+    layout_builder = fn _output_spec, _inputs, _builder_state ->
+      {:layout, :single_fit}
     end
 
     spec = [
-      child(:master, %DynamicSource{output: {generator_state, generator}, stream_format: format})
+      child(:primary, %DynamicSource{output: {generator_state, generator}, stream_format: format})
       |> via_out(:output)
-      |> via_in(:master)
-      |> child(:mixer, %Membrane.VideoMixer.MasterMixer{filter_graph_builder: filter_builder}),
+      |> via_in(:primary)
+      |> child(:mixer, %Membrane.VideoMixer.Filter{layout_builder: layout_builder}),
       get_child(:mixer)
       |> child(:sink, Sink)
     ]
@@ -45,32 +45,18 @@ defmodule Membrane.VideoMixer.MasterMixerTest do
     {red_state, red_generator} = FrameGenerator.red_generator(format)
     {green_state, green_generator} = FrameGenerator.green_generator(format)
 
-    filter_builder = fn
-      %VideoMixer.FrameSpec{width: w, height: h}, specs, _builder_state when length(specs) == 1 ->
-        {"[0:v]scale=#{w}:#{h}:force_original_aspect_ratio=decrease,pad=#{w}:#{h}:-1:-1,setsar=1[out]",
-         [0]}
-
-      %VideoMixer.FrameSpec{width: w, height: h}, _specs, _builder_state ->
-        half_width = div(w, 2)
-
-        graph =
-          "[0:v]scale=#{half_width}:#{h}:force_original_aspect_ratio=decrease," <>
-            "pad=#{half_width}:#{h}:-1:-1,setsar=1[l];" <>
-            "[1:v]scale=#{half_width}:#{h}:force_original_aspect_ratio=decrease," <>
-            "pad=#{half_width}:#{h}:-1:-1,setsar=1[r];" <>
-            "[l][r]hstack=inputs=2[out]"
-
-        {graph, [0, 1]}
+    layout_builder = fn _output_spec, _specs_by_role, _builder_state ->
+      {:layout, :hstack}
     end
 
     spec = [
-      child(:master, %DynamicSource{output: {red_state, red_generator}, stream_format: format})
+      child(:primary, %DynamicSource{output: {red_state, red_generator}, stream_format: format})
       |> via_out(:output)
-      |> via_in(:master)
-      |> child(:mixer, %Membrane.VideoMixer.MasterMixer{filter_graph_builder: filter_builder}),
+      |> via_in(:primary, options: [role: :left])
+      |> child(:mixer, %Membrane.VideoMixer.Filter{layout_builder: layout_builder}),
       child(:extra, %DynamicSource{output: {green_state, green_generator}, stream_format: format})
       |> via_out(:output)
-      |> via_in(Pad.ref(:extra, 1))
+      |> via_in(Pad.ref(:input, 1), options: [role: :right])
       |> get_child(:mixer),
       get_child(:mixer)
       |> child(:sink, Sink)

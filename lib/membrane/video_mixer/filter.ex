@@ -40,7 +40,8 @@ defmodule Membrane.VideoMixer.Filter do
     demand_unit: :buffers,
     accepted_format: Membrane.RawVideo,
     options: [
-      role: [spec: atom(), default: :primary]
+      role: [spec: atom(), default: :primary],
+      delay: [spec: Membrane.Time.t(), default: 0]
     ]
   )
 
@@ -69,9 +70,13 @@ defmodule Membrane.VideoMixer.Filter do
       mixer: nil,
       layout_choice: nil,
       framerate: nil,
+      primary_delay: 0,
+      primary_delay_frames: 1,
       queue_by_pad: %{},
       pad_order: [],
       pad_roles: %{},
+      spec_by_role: %{},
+      last_frame_by_role: %{},
       closed?: false
     }
 
@@ -105,9 +110,12 @@ defmodule Membrane.VideoMixer.Filter do
 
   @impl true
   def handle_pad_removed(pad, _ctx, state) do
+    role = pad_role!(state, pad)
     state = close_frame_queue(state, pad)
     state = %{state | mixer: nil, layout_choice: nil}
     state = update_in(state, [:pad_roles], &Map.delete(&1, pad))
+    state = update_in(state, [:spec_by_role], &Map.delete(&1, role))
+    state = update_in(state, [:last_frame_by_role], &Map.delete(&1, role))
     mix_if_ready(state)
   end
 
@@ -140,19 +148,26 @@ defmodule Membrane.VideoMixer.Filter do
     state = ensure_primary_role(state, pad, ctx)
     role = pad_role!(state, pad)
     frame_spec = build_frame_spec(role, caps)
+    delay_frames = maybe_update_primary_delay(state, pad, ctx, framerate)
 
     state =
       state
       |> put_in([:framerate], framerate)
+      |> put_in([:primary_delay_frames], delay_frames)
       |> update_in([:queue_by_pad, pad], fn queue ->
         FrameQueue.push(queue, frame_spec)
       end)
+      |> update_in([:spec_by_role], &Map.put(&1, role, frame_spec))
 
-    if pad == :primary do
-      {[stream_format: {:output, caps}], state}
-    else
-      {[], state}
-    end
+    base_actions =
+      if pad == :primary do
+        [stream_format: {:output, caps}]
+      else
+        []
+      end
+
+    {mix_actions, state} = mix_if_ready(state)
+    {base_actions ++ mix_actions, state}
   end
 
   @impl true
@@ -230,26 +245,24 @@ defmodule Membrane.VideoMixer.Filter do
       specs_removed? = prev_queues_count != cur_queues_count
       state = if specs_removed?, do: %{state | mixer: nil}, else: state
 
-      all_ready? =
-        Enum.all?(state.queue_by_pad, fn {_pad, queue} -> FrameQueue.ready?(queue) end)
+      primary_queue = Map.get(state.queue_by_pad, :primary)
 
-      if not all_ready? do
+      if primary_queue == nil or not FrameQueue.ready?(primary_queue) do
         {[], state}
       else
-        # consider the case when a pad is removed and it was the one not ready.
-        # The other pads build a buffer and here we would consume just one.
-        frame_sizes =
-          state.queue_by_pad
-          |> Enum.filter(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
-          |> Enum.map(fn {_pad, queue} -> FrameQueue.size(queue) end)
+        primary_queue_size = FrameQueue.size(primary_queue)
 
-        if frame_sizes == [] or Enum.min(frame_sizes) == 0 do
-          # wait for the next frame
+        if primary_queue_size < state.primary_delay_frames do
           {[], state}
         else
-          ready_frames = Enum.min(frame_sizes)
-          {state, buffers} = mix_n(state, ready_frames, [])
-          {[buffer: {:output, buffers}, redemand: :output], state}
+          input_order = input_order(state)
+
+          if Enum.all?(input_order, &Map.has_key?(state.spec_by_role, &1)) do
+            {state, buffers} = mix_n(state, 1, [])
+            {[buffer: {:output, buffers}, redemand: :output], state}
+          else
+            {[], state}
+          end
         end
       end
     end
@@ -266,20 +279,28 @@ defmodule Membrane.VideoMixer.Filter do
     {frames_with_spec, state} =
       state.pad_order
       |> Enum.filter(&Map.has_key?(state.queue_by_pad, &1))
-      |> Enum.filter(fn pad -> FrameQueue.ready?(state.queue_by_pad[pad]) end)
       |> Enum.map_reduce(state, fn pad, state ->
-        {value, queue} = FrameQueue.pop!(state.queue_by_pad[pad])
-        {Map.put(value, :pad, pad), put_in(state, [:queue_by_pad, pad], queue)}
+        queue = state.queue_by_pad[pad]
+
+        if FrameQueue.ready?(queue) and FrameQueue.any?(queue) do
+          {value, queue} = FrameQueue.pop!(queue)
+          {Map.put(value, :pad, pad), put_in(state, [:queue_by_pad, pad], queue)}
+        else
+          {nil, state}
+        end
       end)
 
+    popped_frames = Enum.reject(frames_with_spec, &is_nil/1)
+
     specs_changed? =
-      frames_with_spec
+      popped_frames
       |> Enum.filter(fn %{spec_changed?: x} -> x end)
       |> Enum.any?()
 
     input_order = input_order(state)
-    specs_by_role = Enum.into(frames_with_spec, %{}, fn %{spec: spec} -> {spec.reference, spec} end)
-    output_spec = output_spec_for_primary!(frames_with_spec)
+    specs_by_role = state.spec_by_role
+    primary_role = pad_role!(state, :primary)
+    output_spec = Map.fetch!(specs_by_role, primary_role)
 
     {layout_choice, state} =
       if mixer == nil or specs_changed? do
@@ -314,14 +335,13 @@ defmodule Membrane.VideoMixer.Filter do
         mixer
       end
 
-    frames = Enum.map(frames_with_spec, fn %{frame: x} -> x end)
-    [master_frame | _] = frames
-    frames_by_name = Enum.zip(input_order, frames)
-    {:ok, raw_frame} = VideoMixer.mix(mixer, frames_by_name)
+    {frames_by_name, state} = build_frames_by_role(state, input_order, popped_frames, primary_role)
+    primary_frame = Map.fetch!(frames_by_name, primary_role)
+    {:ok, raw_frame} = VideoMixer.mix(mixer, Map.to_list(frames_by_name))
 
     buffer = %Membrane.Buffer{
       payload: raw_frame,
-      pts: master_frame.pts
+      pts: primary_frame.pts
     }
 
     {%{state | mixer: mixer}, buffer}
@@ -413,10 +433,78 @@ defmodule Membrane.VideoMixer.Filter do
     |> Enum.map(&pad_role!(state, &1))
   end
 
-  defp output_spec_for_primary!(frames_with_spec) do
-    case Enum.find(frames_with_spec, &(&1.pad == :primary)) do
-      %{spec: spec} -> spec
-      nil -> raise "missing primary pad spec"
+  defp build_frames_by_role(state, input_order, popped_frames, primary_role) do
+    popped_by_role =
+      Enum.reduce(popped_frames, %{}, fn %{pad: pad, frame: frame, spec: spec}, acc ->
+        role = pad_role!(state, pad)
+        Map.put(acc, role, %{frame: frame, spec: spec})
+      end)
+
+    {frames_by_name, state} =
+      Enum.reduce(input_order, {%{}, state}, fn role, {frames_by_name, state} ->
+        case popped_by_role do
+          %{^role => %{frame: frame}} ->
+            state = update_in(state, [:last_frame_by_role], &Map.put(&1, role, frame))
+            {Map.put(frames_by_name, role, frame), state}
+
+          _ ->
+            frame = fallback_frame(state, role, frames_by_name[primary_role])
+            {Map.put(frames_by_name, role, frame), state}
+        end
+      end)
+
+    {frames_by_name, state}
+  end
+
+  defp fallback_frame(state, role, primary_frame) do
+    case Map.fetch(state.last_frame_by_role, role) do
+      {:ok, frame} -> frame
+      :error -> black_frame(state, role, primary_frame)
+    end
+  end
+
+  defp black_frame(state, role, %Frame{pts: pts}) do
+    spec = Map.fetch!(state.spec_by_role, role)
+    payload = black_payload(spec)
+
+    %Frame{
+      data: payload,
+      pts: pts,
+      size: byte_size(payload)
+    }
+  end
+
+  defp black_payload(%FrameSpec{pixel_format: :I420, width: width, height: height}) do
+    y_plane = :binary.copy(<<0>>, width * height)
+    uv_size = div(width * height, 4)
+    u_plane = :binary.copy(<<128>>, uv_size)
+    v_plane = :binary.copy(<<128>>, uv_size)
+    y_plane <> u_plane <> v_plane
+  end
+
+  defp black_payload(%FrameSpec{pixel_format: _format, accepted_frame_size: size}) do
+    :binary.copy(<<0>>, size)
+  end
+
+  defp maybe_update_primary_delay(state, :primary, ctx, framerate) do
+    delay =
+      ctx.pads
+      |> Map.get(:primary, %{})
+      |> Map.get(:options, %{})
+      |> Map.get(:delay, state.primary_delay)
+
+    delay_to_frames(delay, framerate)
+  end
+
+  defp maybe_update_primary_delay(state, _pad, _ctx, _framerate), do: state.primary_delay_frames
+
+  defp delay_to_frames(delay, {frames, seconds}) do
+    if delay <= 0 do
+      1
+    else
+      numerator = delay * frames
+      denominator = seconds * Membrane.Time.second()
+      div(numerator + denominator - 1, denominator)
     end
   end
 end

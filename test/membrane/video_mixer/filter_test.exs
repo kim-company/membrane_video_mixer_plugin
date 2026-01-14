@@ -62,19 +62,50 @@ defmodule Membrane.VideoMixer.FilterTest do
       |> child(:sink, Sink)
     ]
 
-    [%{buffer: %Membrane.Buffer{payload: payload}}] =
-      Support.Pipeline.collect_buffers(spec, max_buffers: 1)
+    pipeline = Membrane.Testing.Pipeline.start_link_supervised!(spec: spec)
 
-    sample_width = 8
-    sample_height = 8
-    left_x = 8
-    right_x = div(width, 2) + 8
-    y = div(height - sample_height, 2)
+    matched =
+      await_matching_buffer(pipeline, 4000, fn %Membrane.Buffer{payload: payload} ->
+        sample_width = 8
+        sample_height = 8
+        left_x = 8
+        right_x = div(width, 2) + 8
+        y = div(height - sample_height, 2)
 
-    left_samples = FrameSampler.sample_area(payload, format, left_x, y, sample_width, sample_height)
-    right_samples = FrameSampler.sample_area(payload, format, right_x, y, sample_width, sample_height)
+        left_samples = FrameSampler.sample_area(payload, format, left_x, y, sample_width, sample_height)
+        right_samples = FrameSampler.sample_area(payload, format, right_x, y, sample_width, sample_height)
 
-    assert FrameSampler.uniform_color?(left_samples, FrameSampler.color_to_yuv(:red))
-    assert FrameSampler.uniform_color?(right_samples, FrameSampler.color_to_yuv(:green))
+        FrameSampler.uniform_color?(left_samples, FrameSampler.color_to_yuv(:red)) and
+          FrameSampler.uniform_color?(right_samples, FrameSampler.color_to_yuv(:green))
+      end)
+
+    assert matched != nil
+
+    Membrane.Testing.Pipeline.terminate(pipeline)
+  end
+
+  defp await_matching_buffer(pipeline, timeout, predicate) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_await_matching_buffer(pipeline, predicate, deadline)
+  end
+
+  defp do_await_matching_buffer(pipeline, predicate, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      nil
+    else
+      receive do
+        {Membrane.Testing.Pipeline, ^pipeline,
+         {:handle_child_notification, {{:buffer, buffer}, :sink}}} ->
+          if predicate.(buffer), do: buffer, else: do_await_matching_buffer(pipeline, predicate, deadline)
+
+        {Membrane.Testing.Pipeline, ^pipeline, _other} ->
+          do_await_matching_buffer(pipeline, predicate, deadline)
+      after
+        remaining ->
+          nil
+      end
+    end
   end
 end

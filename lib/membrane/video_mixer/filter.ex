@@ -113,12 +113,15 @@ defmodule Membrane.VideoMixer.Filter do
   @impl true
   def handle_pad_removed(pad, _ctx, state) do
     role = pad_role!(state, pad)
-    state = close_frame_queue(state, pad)
-    state = %{state | mixer: nil, layout_choice: nil}
-    state = update_in(state, [:pad_roles], &Map.delete(&1, pad))
-    state = update_in(state, [:extra_queue_size_by_pad], &Map.delete(&1, pad))
-    state = update_in(state, [:spec_by_role], &Map.delete(&1, role))
-    state = update_in(state, [:last_frame_by_role], &Map.delete(&1, role))
+    state =
+      state
+      |> update_in([:queue_by_pad], &Map.delete(&1, pad))
+      |> update_in([:pad_order], &Enum.reject(&1, fn entry -> entry == pad end))
+      |> update_in([:pad_roles], &Map.delete(&1, pad))
+      |> update_in([:extra_queue_size_by_pad], &Map.delete(&1, pad))
+      |> update_in([:spec_by_role], &Map.delete(&1, role))
+      |> update_in([:last_frame_by_role], &Map.delete(&1, role))
+      |> then(&%{&1 | mixer: nil, layout_choice: nil})
     mix_if_ready(state)
   end
 
@@ -197,7 +200,6 @@ defmodule Membrane.VideoMixer.Filter do
     extra_actions =
       state.queue_by_pad
       |> Enum.reject(fn {pad, _queue} -> pad == :primary end)
-      |> Enum.filter(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
       |> Enum.reject(fn {_pad, queue} -> FrameQueue.any?(queue) or FrameQueue.closed?(queue) end)
       |> Enum.map(fn {pad, _queue} -> {:demand, {pad, 1}} end)
 
@@ -452,6 +454,7 @@ defmodule Membrane.VideoMixer.Filter do
   defp input_order(state) do
     state.pad_order
     |> Enum.filter(&Map.has_key?(state.queue_by_pad, &1))
+    |> Enum.filter(&Map.has_key?(state.pad_roles, &1))
     |> Enum.map(&pad_role!(state, &1))
   end
 

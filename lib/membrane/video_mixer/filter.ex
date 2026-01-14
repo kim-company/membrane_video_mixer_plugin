@@ -51,7 +51,8 @@ defmodule Membrane.VideoMixer.Filter do
     demand_unit: :buffers,
     accepted_format: Membrane.RawVideo,
     options: [
-      role: [spec: atom()]
+      role: [spec: atom()],
+      extra_queue_size: [spec: pos_integer(), default: 1]
     ]
   )
 
@@ -75,6 +76,7 @@ defmodule Membrane.VideoMixer.Filter do
       queue_by_pad: %{},
       pad_order: [],
       pad_roles: %{},
+      extra_queue_size_by_pad: %{},
       spec_by_role: %{},
       last_frame_by_role: %{},
       closed?: false
@@ -114,6 +116,7 @@ defmodule Membrane.VideoMixer.Filter do
     state = close_frame_queue(state, pad)
     state = %{state | mixer: nil, layout_choice: nil}
     state = update_in(state, [:pad_roles], &Map.delete(&1, pad))
+    state = update_in(state, [:extra_queue_size_by_pad], &Map.delete(&1, pad))
     state = update_in(state, [:spec_by_role], &Map.delete(&1, role))
     state = update_in(state, [:last_frame_by_role], &Map.delete(&1, role))
     mix_if_ready(state)
@@ -172,17 +175,33 @@ defmodule Membrane.VideoMixer.Filter do
 
   @impl true
   def handle_demand(:output, _size, :buffers, _context, state) do
-    actions =
+    primary_actions =
+      case Map.get(state.queue_by_pad, :primary) do
+        nil ->
+          []
+
+        queue ->
+          if FrameQueue.ready?(queue) do
+            needed = state.primary_delay_frames - FrameQueue.size(queue)
+
+            if needed > 0 do
+              [{:demand, {:primary, needed}}]
+            else
+              []
+            end
+          else
+            []
+          end
+      end
+
+    extra_actions =
       state.queue_by_pad
-      |> Enum.filter(fn {_pad, queue} ->
-        FrameQueue.ready?(queue)
-      end)
-      |> Enum.reject(fn {_pad, queue} ->
-        FrameQueue.any?(queue) or FrameQueue.closed?(queue)
-      end)
+      |> Enum.reject(fn {pad, _queue} -> pad == :primary end)
+      |> Enum.filter(fn {_pad, queue} -> FrameQueue.ready?(queue) end)
+      |> Enum.reject(fn {_pad, queue} -> FrameQueue.any?(queue) or FrameQueue.closed?(queue) end)
       |> Enum.map(fn {pad, _queue} -> {:demand, {pad, 1}} end)
 
-    {actions, state}
+    {primary_actions ++ extra_actions, state}
   end
 
   @impl true
@@ -198,6 +217,7 @@ defmodule Membrane.VideoMixer.Filter do
 
       state
       |> update_in([:queue_by_pad, pad], fn queue -> FrameQueue.push(queue, frame) end)
+      |> maybe_drop_extra_frames(pad)
       |> mix_if_ready()
     end
   end
@@ -212,9 +232,10 @@ defmodule Membrane.VideoMixer.Filter do
   end
 
   defp master_closed?(state) do
-    state
-    |> get_in([:queue_by_pad, :primary])
-    |> FrameQueue.closed?()
+    case get_in(state, [:queue_by_pad, :primary]) do
+      nil -> false
+      queue -> FrameQueue.closed?(queue)
+    end
   end
 
   defp mix_if_ready(state) do
@@ -396,6 +417,7 @@ defmodule Membrane.VideoMixer.Filter do
     state
     |> init_frame_queue(pad)
     |> update_in([:pad_roles], &Map.put(&1, pad, role))
+    |> update_in([:extra_queue_size_by_pad], &Map.put(&1, pad, extra_queue_size(ctx)))
     end
   end
 
@@ -505,6 +527,42 @@ defmodule Membrane.VideoMixer.Filter do
       numerator = delay * frames
       denominator = seconds * Membrane.Time.second()
       div(numerator + denominator - 1, denominator)
+    end
+  end
+
+  defp extra_queue_size(ctx) do
+    case ctx.pad_options do
+      %{extra_queue_size: size} when is_integer(size) and size > 0 -> size
+      _ -> 1
+    end
+  end
+
+  defp maybe_drop_extra_frames(state, :primary), do: state
+
+  defp maybe_drop_extra_frames(state, pad) do
+    if primary_stalled?(state) do
+      limit = Map.get(state.extra_queue_size_by_pad, pad, 1)
+      queue = Map.get(state.queue_by_pad, pad)
+      trimmed_queue = drop_oldest_ready(queue, limit)
+      put_in(state, [:queue_by_pad, pad], trimmed_queue)
+    else
+      state
+    end
+  end
+
+  defp drop_oldest_ready(queue, limit) do
+    if FrameQueue.size(queue) > limit do
+      {_dropped, queue} = FrameQueue.pop!(queue)
+      drop_oldest_ready(queue, limit)
+    else
+      queue
+    end
+  end
+
+  defp primary_stalled?(state) do
+    case Map.get(state.queue_by_pad, :primary) do
+      nil -> true
+      queue -> not FrameQueue.ready?(queue)
     end
   end
 end

@@ -97,6 +97,54 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
     Pipeline.terminate(pipeline)
   end
 
+  test "extra input drops oldest frames while primary is stalled" do
+    width = 64
+    height = 48
+    format = FrameGenerator.stream_format(width, height, framerate: {30, 1}, pixel_format: :I420)
+    start_ref = make_ref()
+    {green_state, green_generator} =
+      waiting_generator(FrameGenerator.solid_color_payload(format, :green), start_ref)
+
+    red_payload = FrameGenerator.solid_color_payload(format, :red)
+    blue_payload = FrameGenerator.solid_color_payload(format, :blue)
+    yellow_payload = FrameGenerator.solid_color_payload(format, :yellow)
+    burst_ref = make_ref()
+
+    {sidebar_state, sidebar_generator} =
+      burst_generator([red_payload, blue_payload, yellow_payload], notify: {self(), burst_ref})
+
+    layout_builder = fn _output_spec, _specs_by_role, _builder_state ->
+      {:layout, :primary_sidebar}
+    end
+
+    spec = [
+      child(:primary, %DynamicSource{output: {green_state, green_generator}, stream_format: format})
+      |> via_out(:output)
+      |> via_in(:primary)
+      |> child(:mixer, %Membrane.VideoMixer.Filter{layout_builder: layout_builder}),
+      child(:sidebar, %DynamicSource{output: {sidebar_state, sidebar_generator}, stream_format: format})
+      |> via_out(:output)
+      |> via_in(Membrane.Pad.ref(:input, :sidebar), options: [role: :sidebar, extra_queue_size: 2])
+      |> get_child(:mixer),
+      get_child(:mixer)
+      |> child(:sink, Sink)
+    ]
+
+    pipeline = Pipeline.start_link_supervised!(spec: spec)
+
+    primary_pid = Pipeline.get_child_pid!(pipeline, :primary)
+
+    assert_receive {:burst_emitted, ^burst_ref}, 2000
+
+    send(primary_pid, {:start, start_ref})
+
+    buffer = await_buffer_with_color(pipeline, format, :right, :blue, 4000)
+    assert buffer != nil
+    assert sample_color(buffer.payload, format, :left) == :green
+
+    Pipeline.terminate(pipeline)
+  end
+
   defp phased_generator(phases, opts \\ []) do
     pts_start = Keyword.get(opts, :pts_start, 0)
     pts_step = Keyword.get(opts, :pts_step, 1)
@@ -163,6 +211,35 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
         {actions, %{state | pts: state.pts + pts_step}}
       else
         {[], state}
+      end
+    end
+
+    {state, generator}
+  end
+
+  defp burst_generator(payloads, opts) do
+    pts_start = Keyword.get(opts, :pts_start, 0)
+    pts_step = Keyword.get(opts, :pts_step, 1)
+    notify = Keyword.get(opts, :notify)
+
+    state = %{payloads: payloads, pts: pts_start, emitted?: false, notify: notify}
+
+    generator = fn state, pad, _count ->
+      if state.emitted? do
+        {[], state}
+      else
+        {buffers, next_pts} =
+          Enum.map_reduce(state.payloads, state.pts, fn payload, pts ->
+            {%Buffer{payload: payload, pts: pts}, pts + pts_step}
+          end)
+        actions = [buffer: {pad, buffers}]
+
+        if state.notify do
+          {pid, ref} = state.notify
+          send(pid, {:burst_emitted, ref})
+        end
+
+        {actions, %{state | emitted?: true, pts: next_pts}}
       end
     end
 

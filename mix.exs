@@ -33,7 +33,8 @@ defmodule Membrane.VideoMixer.MixProject do
     [
       {:membrane_core, "~> 1.2"},
       {:membrane_raw_video_format, "~> 0.4"},
-      {:video_mixer, "~> 2.0"}
+      {:video_mixer, "~> 2.0"},
+      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
     ]
   end
 

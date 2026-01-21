@@ -43,7 +43,8 @@ defmodule Membrane.VideoMixer.Filter do
     accepted_format: Membrane.RawVideo,
     options: [
       role: [spec: atom(), default: :primary],
-      delay: [spec: Membrane.Time.t(), default: 0]
+      delay: [spec: Membrane.Time.t(), default: 0],
+      fit_mode: [spec: :crop | :fit, default: :crop]
     ]
   )
 
@@ -54,7 +55,8 @@ defmodule Membrane.VideoMixer.Filter do
     accepted_format: Membrane.RawVideo,
     options: [
       role: [spec: atom()],
-      extra_queue_size: [spec: pos_integer(), default: 1]
+      extra_queue_size: [spec: pos_integer(), default: 1],
+      fit_mode: [spec: :crop | :fit, default: :crop]
     ]
   )
 
@@ -78,6 +80,7 @@ defmodule Membrane.VideoMixer.Filter do
       queue_by_pad: %{},
       pad_order: [],
       pad_roles: %{},
+      fit_mode_by_pad: %{},
       extra_queue_size_by_pad: %{},
       spec_by_role: %{},
       last_frame_by_role: %{},
@@ -121,6 +124,7 @@ defmodule Membrane.VideoMixer.Filter do
       |> update_in([:queue_by_pad], &Map.delete(&1, pad))
       |> update_in([:pad_order], &Enum.reject(&1, fn entry -> entry == pad end))
       |> update_in([:pad_roles], &Map.delete(&1, pad))
+      |> update_in([:fit_mode_by_pad], &Map.delete(&1, pad))
       |> update_in([:extra_queue_size_by_pad], &Map.delete(&1, pad))
       |> update_in([:spec_by_role], &Map.delete(&1, role))
       |> update_in([:last_frame_by_role], &Map.delete(&1, role))
@@ -157,7 +161,7 @@ defmodule Membrane.VideoMixer.Filter do
   def handle_stream_format(pad, caps = %Membrane.RawVideo{framerate: framerate}, ctx, state) do
     state = ensure_primary_role(state, pad, ctx)
     role = pad_role!(state, pad)
-    frame_spec = build_frame_spec(role, caps)
+    frame_spec = build_frame_spec(state, role, pad, caps)
     delay_frames = maybe_update_primary_delay(state, pad, ctx, framerate)
 
     state =
@@ -412,16 +416,18 @@ defmodule Membrane.VideoMixer.Filter do
     end
   end
 
-  defp build_frame_spec(role, caps) do
+  defp build_frame_spec(state, role, pad, caps) do
     %Membrane.RawVideo{width: width, height: height, pixel_format: format} = caps
     {:ok, size} = Membrane.RawVideo.frame_size(format, width, height)
+    fit_mode = Map.get(state.fit_mode_by_pad, pad, :crop)
 
     %FrameSpec{
       reference: role,
       width: width,
       height: height,
       pixel_format: format,
-      accepted_frame_size: size
+      accepted_frame_size: size,
+      fit_mode: fit_mode
     }
   end
 
@@ -435,6 +441,8 @@ defmodule Membrane.VideoMixer.Filter do
           _ -> raise "dynamic input pads require :role option"
         end
 
+      fit_mode = Map.get(ctx.pad_options, :fit_mode, :crop)
+
       if Map.values(state.pad_roles) |> Enum.member?(role) do
         raise "duplicate role #{inspect(role)} for pad #{inspect(pad)}"
       end
@@ -442,16 +450,19 @@ defmodule Membrane.VideoMixer.Filter do
       state
       |> init_frame_queue(pad)
       |> update_in([:pad_roles], &Map.put(&1, pad, role))
+      |> update_in([:fit_mode_by_pad], &Map.put(&1, pad, fit_mode))
       |> update_in([:extra_queue_size_by_pad], &Map.put(&1, pad, extra_queue_size(ctx)))
     end
   end
 
   defp ensure_primary_role(state, :primary, ctx) do
-    role =
+    primary_options =
       ctx.pads
       |> Map.get(:primary, %{})
       |> Map.get(:options, %{})
-      |> Map.get(:role, :primary)
+
+    role = Map.get(primary_options, :role, :primary)
+    fit_mode = Map.get(primary_options, :fit_mode, :crop)
 
     cond do
       Map.has_key?(state.pad_roles, :primary) ->
@@ -461,7 +472,9 @@ defmodule Membrane.VideoMixer.Filter do
         raise "duplicate role #{inspect(role)} for pad :primary"
 
       true ->
-        update_in(state, [:pad_roles], &Map.put(&1, :primary, role))
+        state
+        |> update_in([:pad_roles], &Map.put(&1, :primary, role))
+        |> update_in([:fit_mode_by_pad], &Map.put(&1, :primary, fit_mode))
     end
   end
 

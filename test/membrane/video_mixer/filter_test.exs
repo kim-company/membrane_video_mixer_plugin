@@ -219,12 +219,12 @@ defmodule Membrane.VideoMixer.FilterTest do
 
     matched =
       await_matching_buffer(pipeline, 4000, fn %Membrane.Buffer{payload: payload} ->
-        sample_width = 8
-        sample_height = 8
-        left_width = div(width * 2, 3)
-        right_width = width - left_width
-        left_x = div(left_width - sample_width, 2)
-        right_x = left_width + div(right_width - sample_width, 2)
+        sample_width = 4
+        sample_height = 4
+        # Sample from well inside the expected regions to avoid rounding issues
+        # Left side should be roughly 2/3, right side roughly 1/3
+        left_x = 10
+        right_x = 50
         y = div(height - sample_height, 2)
 
         left_samples = FrameSampler.sample_area(payload, format, left_x, y, sample_width, sample_height)

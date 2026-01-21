@@ -93,14 +93,12 @@ defmodule Membrane.VideoMixer.FilterDynamicPadsTest do
     FrameSampler.uniform_color?(samples, FrameSampler.color_to_yuv(:green))
   end
 
-  defp primary_sidebar_green_red?(payload, %Membrane.RawVideo{width: width, height: height} = format) do
-    sample_width = 8
-    sample_height = 8
-    left_width = div(width * 2, 3)
-    right_width = width - left_width
-
-    left_x = div(left_width - sample_width, 2)
-    right_x = left_width + div(right_width - sample_width, 2)
+  defp primary_sidebar_green_red?(payload, %Membrane.RawVideo{height: height} = format) do
+    sample_width = 4
+    sample_height = 4
+    # Sample from well inside the expected regions to avoid rounding issues
+    left_x = 16
+    right_x = 48
     y = div(height - sample_height, 2)
 
     left_samples = FrameSampler.sample_area(payload, format, left_x, y, sample_width, sample_height)

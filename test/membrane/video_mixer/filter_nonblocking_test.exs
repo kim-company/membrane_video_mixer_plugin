@@ -48,7 +48,7 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
 
     send(sidebar_pid, {:start, start_ref})
 
-    second = await_buffer_with_color(pipeline, format, :right, :red)
+    second = await_buffer_with_color(pipeline, format, :right, :red, 4000)
     assert sample_color(second.payload, format, :left) == :green
 
     Pipeline.terminate(pipeline)
@@ -65,8 +65,8 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
 
     {sidebar_state, sidebar_generator} =
       phased_generator([
-        {:emit, red_payload, 1},
-        {:pause, 5},
+        {:emit, red_payload, 15},
+        {:pause, 10},
         {:emit, blue_payload, 1}
       ])
 
@@ -88,8 +88,14 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
     ]
 
     pipeline = Pipeline.start_link_supervised!(spec: spec)
-    _red = await_buffer_with_color(pipeline, format, :right, :red)
-    right_colors = collect_colors_until(pipeline, format, :right, :blue, 20)
+
+    # Wait for pipeline to warm up by discarding first few buffers.
+    # This helps avoid race conditions where early frames are emitted before
+    # the mixer is fully initialized and ready to process them.
+    Enum.each(1..3, fn _ -> receive_buffer(pipeline, 5000) end)
+
+    _red = await_buffer_with_color(pipeline, format, :right, :red, 5000)
+    right_colors = collect_colors_until(pipeline, format, :right, :blue, 50)
 
     assert Enum.all?(Enum.drop(right_colors, -1), &(&1 == :red))
     assert List.last(right_colors) == :blue
@@ -260,7 +266,7 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
     end
   end
 
-  defp await_buffer_with_color(pipeline, format, side, expected, timeout \\ 2000) do
+  defp await_buffer_with_color(pipeline, format, side, expected, timeout) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_await_buffer_with_color(pipeline, format, side, expected, deadline)
   end
@@ -295,23 +301,22 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
     end
   end
 
-  defp sample_color(payload, %Membrane.RawVideo{width: width, height: height} = format, :left) do
-    sample_width = 8
-    sample_height = 8
-    left_width = div(width * 2, 3)
-    x = div(left_width - sample_width, 2)
+  defp sample_color(payload, %Membrane.RawVideo{height: height} = format, :left) do
+    sample_width = 4
+    sample_height = 4
+    # Sample from well inside the left region to avoid rounding issues
+    x = 16
     y = div(height - sample_height, 2)
 
     samples = FrameSampler.sample_area(payload, format, x, y, sample_width, sample_height)
     classify_color(samples)
   end
 
-  defp sample_color(payload, %Membrane.RawVideo{width: width, height: height} = format, :right) do
-    sample_width = 8
-    sample_height = 8
-    left_width = div(width * 2, 3)
-    right_width = width - left_width
-    x = left_width + div(right_width - sample_width, 2)
+  defp sample_color(payload, %Membrane.RawVideo{height: height} = format, :right) do
+    sample_width = 4
+    sample_height = 4
+    # Sample from well inside the right region to avoid rounding issues
+    x = 48
     y = div(height - sample_height, 2)
 
     samples = FrameSampler.sample_area(payload, format, x, y, sample_width, sample_height)

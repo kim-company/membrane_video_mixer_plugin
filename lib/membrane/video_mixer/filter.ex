@@ -73,6 +73,7 @@ defmodule Membrane.VideoMixer.Filter do
       layout_builder: opts.layout_builder,
       builder_state: opts.builder_state,
       mixer: nil,
+      mixer_specs: nil,
       layout_choice: nil,
       framerate: nil,
       primary_delay: 0,
@@ -105,7 +106,7 @@ defmodule Membrane.VideoMixer.Filter do
   @impl true
   def handle_pad_added(pad, ctx, state) do
     state = register_pad_role!(state, pad, ctx)
-    state = %{state | mixer: nil, layout_choice: nil}
+    state = %{state | mixer: nil, mixer_specs: nil, layout_choice: nil}
 
     actions =
       if ctx.playback == :playing,
@@ -128,7 +129,7 @@ defmodule Membrane.VideoMixer.Filter do
       |> update_in([:extra_queue_size_by_pad], &Map.delete(&1, pad))
       |> update_in([:spec_by_role], &Map.delete(&1, role))
       |> update_in([:last_frame_by_role], &Map.delete(&1, role))
-      |> then(&%{&1 | mixer: nil, layout_choice: nil})
+      |> then(&%{&1 | mixer: nil, mixer_specs: nil, layout_choice: nil})
 
     mix_if_ready(state)
   end
@@ -164,6 +165,10 @@ defmodule Membrane.VideoMixer.Filter do
     frame_spec = build_frame_spec(state, role, pad, caps)
     delay_frames = maybe_update_primary_delay(state, pad, ctx, framerate)
 
+    # Check if spec changed to clear cached last_frame
+    old_spec = Map.get(state.spec_by_role, role)
+    spec_changed? = old_spec != nil and old_spec.accepted_frame_size != frame_spec.accepted_frame_size
+
     state =
       state
       |> put_in([:framerate], framerate)
@@ -172,7 +177,10 @@ defmodule Membrane.VideoMixer.Filter do
         FrameQueue.push(queue, frame_spec)
       end)
       |> update_in([:spec_by_role], &Map.put(&1, role, frame_spec))
-      |> then(&%{&1 | mixer: nil, layout_choice: nil})
+      |> then(&%{&1 | mixer: nil, mixer_specs: nil, layout_choice: nil})
+      |> then(fn s ->
+        if spec_changed?, do: update_in(s, [:last_frame_by_role], &Map.delete(&1, role)), else: s
+      end)
 
     base_actions =
       if pad == :primary do
@@ -246,11 +254,11 @@ defmodule Membrane.VideoMixer.Filter do
 
   @impl true
   def handle_parent_notification(:rebuild_filter_graph, _ctx, state) do
-    {[], %{state | mixer: nil, layout_choice: nil}}
+    {[], %{state | mixer: nil, mixer_specs: nil, layout_choice: nil}}
   end
 
   def handle_parent_notification({:rebuild_filter_graph, builder_state}, _ctx, state) do
-    {[], %{state | mixer: nil, layout_choice: nil, builder_state: builder_state}}
+    {[], %{state | mixer: nil, mixer_specs: nil, layout_choice: nil, builder_state: builder_state}}
   end
 
   defp master_closed?(state) do
@@ -279,6 +287,22 @@ defmodule Membrane.VideoMixer.Filter do
           end)
         end)
         |> then(fn state ->
+          # Clean up roles for deleted pads
+          deleted_pads =
+            state.pad_order
+            |> Enum.reject(&Map.has_key?(state.queue_by_pad, &1))
+
+          Enum.reduce(deleted_pads, state, fn pad, state ->
+            case Map.get(state.pad_roles, pad) do
+              nil -> state
+              role ->
+                state
+                |> update_in([:spec_by_role], &Map.delete(&1, role))
+                |> update_in([:last_frame_by_role], &Map.delete(&1, role))
+            end
+          end)
+        end)
+        |> then(fn state ->
           update_in(state, [:pad_order], fn pad_order ->
             Enum.filter(pad_order, &Map.has_key?(state.queue_by_pad, &1))
           end)
@@ -286,7 +310,7 @@ defmodule Membrane.VideoMixer.Filter do
 
       cur_queues_count = map_size(state.queue_by_pad)
       specs_removed? = prev_queues_count != cur_queues_count
-      state = if specs_removed?, do: %{state | mixer: nil}, else: state
+      state = if specs_removed?, do: %{state | mixer: nil, mixer_specs: nil}, else: state
 
       primary_queue = Map.get(state.queue_by_pad, :primary)
 
@@ -343,48 +367,56 @@ defmodule Membrane.VideoMixer.Filter do
 
     popped_frames = Enum.reject(frames_with_spec, &is_nil/1)
 
-    specs_changed? =
-      popped_frames
-      |> Enum.filter(fn %{spec_changed?: x} -> x end)
-      |> Enum.any?()
+    # Build specs from POPPED FRAMES (not spec_by_role)
+    specs_from_popped =
+      Enum.reduce(popped_frames, %{}, fn %{pad: pad, spec: spec}, acc ->
+        role = pad_role!(state, pad)
+        Map.put(acc, role, spec)
+      end)
 
     input_order = input_order(state)
-    specs_by_role = state.spec_by_role
     primary_role = pad_role!(state, :primary)
-    output_spec = Map.fetch!(specs_by_role, primary_role)
+    # Use popped frame spec if available, fallback to spec_by_role
+    output_spec = Map.get(specs_from_popped, primary_role) || Map.fetch!(state.spec_by_role, primary_role)
 
-    {layout_choice, state} =
-      if mixer == nil or specs_changed? do
-        ensure_layout_choice(state, output_spec, true)
-      else
-        {state.layout_choice, state}
-      end
-
+    {layout_choice, state} = ensure_layout_choice(state, output_spec, mixer == nil)
     required_roles = required_roles(layout_choice, input_order)
-    specs_for_mixer = specs_for_roles(specs_by_role, required_roles)
 
-    mixer =
-      if specs_changed? or mixer == nil do
+    # Use popped frame spec if available, fallback to spec_by_role for roles without frames
+    specs_for_mixer =
+      Enum.reduce(required_roles, %{}, fn role, acc ->
+        spec = Map.get(specs_from_popped, role) || Map.get(state.spec_by_role, role)
+        if spec, do: Map.put(acc, role, spec), else: acc
+      end)
+
+    # Rebuild mixer if specs changed from what mixer was built with
+    mixer_specs_changed? = mixer != nil and mixer_specs_differ?(state.mixer_specs, specs_for_mixer)
+
+    {mixer, state} =
+      if mixer_specs_changed? or mixer == nil do
         specs = Enum.map(required_roles, &Map.fetch!(specs_for_mixer, &1))
 
-        case layout_choice do
-          {:layout, layout} ->
-            {:ok, mixer} = VideoMixer.init(layout, specs_for_mixer, output_spec)
-            mixer
+        new_mixer =
+          case layout_choice do
+            {:layout, layout} ->
+              {:ok, mixer} = VideoMixer.init(layout, specs_for_mixer, output_spec)
+              mixer
 
-          {:raw, filter_graph} ->
-            {:ok, mixer} = VideoMixer.init_raw(filter_graph, specs, required_roles, output_spec)
-            mixer
+            {:raw, filter_graph} ->
+              {:ok, mixer} = VideoMixer.init_raw(filter_graph, specs, required_roles, output_spec)
+              mixer
 
-          other ->
-            raise "invalid layout_builder result: #{inspect(other)}"
-        end
+            other ->
+              raise "invalid layout_builder result: #{inspect(other)}"
+          end
+
+        {new_mixer, %{state | mixer_specs: specs_for_mixer}}
       else
-        mixer
+        {mixer, state}
       end
 
     {frames_by_name, state} =
-      build_frames_by_role(state, required_roles, popped_frames, primary_role)
+      build_frames_by_role(state, required_roles, popped_frames, primary_role, specs_for_mixer)
 
     primary_frame = Map.fetch!(frames_by_name, primary_role)
     {:ok, raw_frame} = VideoMixer.mix(mixer, Map.to_list(frames_by_name))
@@ -494,7 +526,7 @@ defmodule Membrane.VideoMixer.Filter do
     |> Enum.map(&pad_role!(state, &1))
   end
 
-  defp build_frames_by_role(state, input_order, popped_frames, primary_role) do
+  defp build_frames_by_role(state, input_order, popped_frames, primary_role, specs_for_mixer) do
     popped_by_role =
       Enum.reduce(popped_frames, %{}, fn %{pad: pad, frame: frame, spec: spec}, acc ->
         role = pad_role!(state, pad)
@@ -514,7 +546,7 @@ defmodule Membrane.VideoMixer.Filter do
             {Map.put(frames_by_name, role, frame), state}
 
           _ ->
-            frame = fallback_frame(state, role, frames_by_name[primary_role])
+            frame = fallback_frame(state, role, frames_by_name[primary_role], specs_for_mixer)
             {Map.put(frames_by_name, role, frame), state}
         end
       end)
@@ -522,15 +554,15 @@ defmodule Membrane.VideoMixer.Filter do
     {frames_by_name, state}
   end
 
-  defp fallback_frame(state, role, primary_frame) do
+  defp fallback_frame(state, role, primary_frame, specs_for_mixer) do
     case Map.fetch(state.last_frame_by_role, role) do
       {:ok, frame} -> frame
-      :error -> black_frame(state, role, primary_frame)
+      :error -> black_frame(role, primary_frame, specs_for_mixer)
     end
   end
 
-  defp black_frame(state, role, %Frame{pts: pts}) do
-    spec = Map.fetch!(state.spec_by_role, role)
+  defp black_frame(role, %Frame{pts: pts}, specs_for_mixer) do
+    spec = Map.fetch!(specs_for_mixer, role)
     payload = black_payload(spec)
 
     %Frame{
@@ -598,6 +630,19 @@ defmodule Membrane.VideoMixer.Filter do
 
   defp specs_for_roles(specs_by_role, roles) do
     Map.take(specs_by_role, roles)
+  end
+
+  defp mixer_specs_differ?(mixer_specs, _specs_for_mixer) when mixer_specs == nil, do: true
+
+  defp mixer_specs_differ?(mixer_specs, specs_for_mixer) do
+    # Check if any spec in specs_for_mixer has a different accepted_frame_size than mixer_specs
+    map_size(mixer_specs) != map_size(specs_for_mixer) or
+      Enum.any?(specs_for_mixer, fn {role, spec} ->
+        case Map.get(mixer_specs, role) do
+          nil -> true
+          mixer_spec -> mixer_spec.accepted_frame_size != spec.accepted_frame_size
+        end
+      end)
   end
 
   defp layout_roles(:single_fit), do: [:primary]

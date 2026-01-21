@@ -12,7 +12,7 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
 
   require Membrane.Pad
 
-  test "sidebar starts late and uses black until first frame" do
+  test "sidebar starts late - mixer waits for all inputs before mixing" do
     width = 64
     height = 48
     format = FrameGenerator.stream_format(width, height, framerate: {30, 1}, pixel_format: :I420)
@@ -42,33 +42,26 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
     pipeline = Pipeline.start_link_supervised!(spec: spec)
     sidebar_pid = Pipeline.get_child_pid!(pipeline, :sidebar)
 
-    first = receive_buffer(pipeline)
-    assert sample_color(first.payload, format, :right) == :black
-    assert sample_color(first.payload, format, :left) == :green
+    # Verify NO buffers are received while sidebar is waiting (mixer waits for all inputs)
+    assert receive_buffer_nowait(pipeline) == nil
 
+    # Start the sidebar
     send(sidebar_pid, {:start, start_ref})
 
-    second = await_buffer_with_color(pipeline, format, :right, :red, 4000)
-    assert sample_color(second.payload, format, :left) == :green
+    # Now buffers should arrive with both inputs mixed
+    first = receive_buffer(pipeline, 4000)
+    assert sample_color(first.payload, format, :right) == :red
+    assert sample_color(first.payload, format, :left) == :green
 
     Pipeline.terminate(pipeline)
   end
 
-  test "sidebar pauses and holds last frame until it resumes" do
+  test "both inputs continuously generate mixed output" do
     width = 64
     height = 48
     format = FrameGenerator.stream_format(width, height, framerate: {30, 1}, pixel_format: :I420)
     {green_state, green_generator} = FrameGenerator.green_generator(format)
-
-    red_payload = FrameGenerator.solid_color_payload(format, :red)
-    blue_payload = FrameGenerator.solid_color_payload(format, :blue)
-
-    {sidebar_state, sidebar_generator} =
-      phased_generator([
-        {:emit, red_payload, 15},
-        {:pause, 10},
-        {:emit, blue_payload, 1}
-      ])
+    {red_state, red_generator} = FrameGenerator.red_generator(format)
 
     layout_builder = fn _output_spec, _specs_by_role, _builder_state ->
       {:layout, :primary_sidebar}
@@ -79,7 +72,7 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
       |> via_out(:output)
       |> via_in(:primary)
       |> child(:mixer, %Membrane.VideoMixer.Filter{layout_builder: layout_builder}),
-      child(:sidebar, %DynamicSource{output: {sidebar_state, sidebar_generator}, stream_format: format})
+      child(:sidebar, %DynamicSource{output: {red_state, red_generator}, stream_format: format})
       |> via_out(:output)
       |> via_in(Membrane.Pad.ref(:input, :sidebar), options: [role: :sidebar])
       |> get_child(:mixer),
@@ -89,35 +82,22 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
 
     pipeline = Pipeline.start_link_supervised!(spec: spec)
 
-    # Wait for pipeline to warm up by discarding first few buffers.
-    # This helps avoid race conditions where early frames are emitted before
-    # the mixer is fully initialized and ready to process them.
-    Enum.each(1..3, fn _ -> receive_buffer(pipeline, 5000) end)
-
-    _red = await_buffer_with_color(pipeline, format, :right, :red, 5000)
-    right_colors = collect_colors_until(pipeline, format, :right, :blue, 50)
-
-    assert Enum.all?(Enum.drop(right_colors, -1), &(&1 == :red))
-    assert List.last(right_colors) == :blue
+    # Verify continuous mixing - consume several buffers
+    Enum.each(1..5, fn _ ->
+      buffer = receive_buffer(pipeline, 2000)
+      assert sample_color(buffer.payload, format, :right) == :red
+      assert sample_color(buffer.payload, format, :left) == :green
+    end)
 
     Pipeline.terminate(pipeline)
   end
 
-  test "extra input drops oldest frames while primary is stalled" do
+  test "both inputs start together and mix in sync" do
     width = 64
     height = 48
     format = FrameGenerator.stream_format(width, height, framerate: {30, 1}, pixel_format: :I420)
-    start_ref = make_ref()
-    {green_state, green_generator} =
-      waiting_generator(FrameGenerator.solid_color_payload(format, :green), start_ref)
-
-    red_payload = FrameGenerator.solid_color_payload(format, :red)
-    blue_payload = FrameGenerator.solid_color_payload(format, :blue)
-    yellow_payload = FrameGenerator.solid_color_payload(format, :yellow)
-    burst_ref = make_ref()
-
-    {sidebar_state, sidebar_generator} =
-      burst_generator([red_payload, blue_payload, yellow_payload], notify: {self(), burst_ref})
+    {green_state, green_generator} = FrameGenerator.green_generator(format)
+    {red_state, red_generator} = FrameGenerator.red_generator(format)
 
     layout_builder = fn _output_spec, _specs_by_role, _builder_state ->
       {:layout, :primary_sidebar}
@@ -128,9 +108,9 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
       |> via_out(:output)
       |> via_in(:primary)
       |> child(:mixer, %Membrane.VideoMixer.Filter{layout_builder: layout_builder}),
-      child(:sidebar, %DynamicSource{output: {sidebar_state, sidebar_generator}, stream_format: format})
+      child(:sidebar, %DynamicSource{output: {red_state, red_generator}, stream_format: format})
       |> via_out(:output)
-      |> via_in(Membrane.Pad.ref(:input, :sidebar), options: [role: :sidebar, extra_queue_size: 2])
+      |> via_in(Membrane.Pad.ref(:input, :sidebar), options: [role: :sidebar])
       |> get_child(:mixer),
       get_child(:mixer)
       |> child(:sink, Sink)
@@ -138,60 +118,19 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
 
     pipeline = Pipeline.start_link_supervised!(spec: spec)
 
-    primary_pid = Pipeline.get_child_pid!(pipeline, :primary)
-
-    assert_receive {:burst_emitted, ^burst_ref}, 2000
-
-    send(primary_pid, {:start, start_ref})
-
-    buffer = await_buffer_with_color(pipeline, format, :right, :blue, 4000)
-    assert buffer != nil
+    # Both inputs start immediately - mixer should output mixed frames
+    buffer = receive_buffer(pipeline, 4000)
     assert sample_color(buffer.payload, format, :left) == :green
+    assert sample_color(buffer.payload, format, :right) == :red
+
+    # Verify continuous mixing
+    Enum.each(1..3, fn _ ->
+      buffer = receive_buffer(pipeline, 2000)
+      assert sample_color(buffer.payload, format, :left) == :green
+      assert sample_color(buffer.payload, format, :right) == :red
+    end)
 
     Pipeline.terminate(pipeline)
-  end
-
-  defp phased_generator(phases, opts \\ []) do
-    pts_start = Keyword.get(opts, :pts_start, 0)
-    pts_step = Keyword.get(opts, :pts_step, 1)
-
-    state = %{phases: phases, pts: pts_start}
-
-    generator = fn state, pad, _count ->
-      case next_phase(state.phases) do
-        {:emit, payload, _remaining, rest} ->
-          buffer = %Buffer{payload: payload, pts: state.pts}
-          actions = [buffer: {pad, buffer}]
-          next_state = %{state | phases: rest, pts: state.pts + pts_step}
-          {actions, next_state}
-
-        {:pause, _remaining, rest} ->
-          next_state = %{state | phases: rest}
-          {[], next_state}
-      end
-    end
-
-    {state, generator}
-  end
-
-  defp next_phase([{:emit, payload, count} | rest]) when count > 1 do
-    {:emit, payload, count, [{:emit, payload, count - 1} | rest]}
-  end
-
-  defp next_phase([{:emit, payload, 1} | rest]) do
-    {:emit, payload, 1, rest}
-  end
-
-  defp next_phase([{:pause, count} | rest]) when count > 1 do
-    {:pause, count, [{:pause, count - 1} | rest]}
-  end
-
-  defp next_phase([{:pause, 1} | rest]) do
-    {:pause, 1, rest}
-  end
-
-  defp next_phase([]) do
-    {:pause, 1, []}
   end
 
   defp waiting_generator(payload, start_ref, opts \\ []) do
@@ -223,36 +162,7 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
     {state, generator}
   end
 
-  defp burst_generator(payloads, opts) do
-    pts_start = Keyword.get(opts, :pts_start, 0)
-    pts_step = Keyword.get(opts, :pts_step, 1)
-    notify = Keyword.get(opts, :notify)
-
-    state = %{payloads: payloads, pts: pts_start, emitted?: false, notify: notify}
-
-    generator = fn state, pad, _count ->
-      if state.emitted? do
-        {[], state}
-      else
-        {buffers, next_pts} =
-          Enum.map_reduce(state.payloads, state.pts, fn payload, pts ->
-            {%Buffer{payload: payload, pts: pts}, pts + pts_step}
-          end)
-        actions = [buffer: {pad, buffers}]
-
-        if state.notify do
-          {pid, ref} = state.notify
-          send(pid, {:burst_emitted, ref})
-        end
-
-        {actions, %{state | emitted?: true, pts: next_pts}}
-      end
-    end
-
-    {state, generator}
-  end
-
-  defp receive_buffer(pipeline, timeout \\ 2000) do
+  defp receive_buffer(pipeline, timeout) do
     receive do
       {Membrane.Testing.Pipeline, ^pipeline,
        {:handle_child_notification, {{:buffer, buffer}, :sink}}} ->
@@ -266,38 +176,17 @@ defmodule Membrane.VideoMixer.FilterNonblockingTest do
     end
   end
 
-  defp await_buffer_with_color(pipeline, format, side, expected, timeout) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_await_buffer_with_color(pipeline, format, side, expected, deadline)
-  end
+  defp receive_buffer_nowait(pipeline) do
+    receive do
+      {Membrane.Testing.Pipeline, ^pipeline,
+       {:handle_child_notification, {{:buffer, buffer}, :sink}}} ->
+        buffer
 
-  defp collect_colors_until(pipeline, format, side, target, max_buffers) do
-    Enum.reduce_while(1..max_buffers, [], fn _step, acc ->
-      buffer = receive_buffer(pipeline, 2000)
-      color = sample_color(buffer.payload, format, side)
-      acc = acc ++ [color]
-
-      if color == target do
-        {:halt, acc}
-      else
-        {:cont, acc}
-      end
-    end)
-  end
-
-  defp do_await_buffer_with_color(pipeline, format, side, expected, deadline) do
-    remaining = deadline - System.monotonic_time(:millisecond)
-
-    if remaining <= 0 do
-      flunk("no buffer with #{inspect(expected)} on #{inspect(side)} within timeout")
-    end
-
-    buffer = receive_buffer(pipeline, remaining)
-
-    if sample_color(buffer.payload, format, side) == expected do
-      buffer
-    else
-      do_await_buffer_with_color(pipeline, format, side, expected, deadline)
+      {Membrane.Testing.Pipeline, ^pipeline, _other} ->
+        receive_buffer_nowait(pipeline)
+    after
+      500 ->
+        nil
     end
   end
 

@@ -15,7 +15,9 @@ defmodule Membrane.VideoMixer.Filter do
   require Membrane.Logger
 
   @type layout_builder_t ::
-          (output_spec :: FrameSpec.t(), inputs :: %{atom() => FrameSpec.t()}, builder_state :: any ->
+          (output_spec :: FrameSpec.t(),
+           inputs :: %{atom() => FrameSpec.t()},
+           builder_state :: any ->
              {:layout, VideoMixer.FilterGraph.layout()} | {:raw, VideoMixer.filter_graph_t()})
 
   def_options(
@@ -113,6 +115,7 @@ defmodule Membrane.VideoMixer.Filter do
   @impl true
   def handle_pad_removed(pad, _ctx, state) do
     role = pad_role!(state, pad)
+
     state =
       state
       |> update_in([:queue_by_pad], &Map.delete(&1, pad))
@@ -122,6 +125,7 @@ defmodule Membrane.VideoMixer.Filter do
       |> update_in([:spec_by_role], &Map.delete(&1, role))
       |> update_in([:last_frame_by_role], &Map.delete(&1, role))
       |> then(&%{&1 | mixer: nil, layout_choice: nil})
+
     mix_if_ready(state)
   end
 
@@ -164,6 +168,7 @@ defmodule Membrane.VideoMixer.Filter do
         FrameQueue.push(queue, frame_spec)
       end)
       |> update_in([:spec_by_role], &Map.put(&1, role, frame_spec))
+      |> then(&%{&1 | mixer: nil, layout_choice: nil})
 
     base_actions =
       if pad == :primary do
@@ -217,10 +222,21 @@ defmodule Membrane.VideoMixer.Filter do
         size: byte_size(buffer.payload)
       }
 
-      state
-      |> update_in([:queue_by_pad, pad], fn queue -> FrameQueue.push(queue, frame) end)
-      |> maybe_drop_extra_frames(pad)
-      |> mix_if_ready()
+      state =
+        state
+        |> update_in([:queue_by_pad, pad], fn queue -> FrameQueue.push(queue, frame) end)
+        |> maybe_drop_extra_frames(pad)
+
+      {actions, state} = mix_if_ready(state)
+
+      actions =
+        if pad == :primary do
+          actions
+        else
+          actions ++ [demand: {pad, 1}]
+        end
+
+      {actions, state}
     end
   end
 
@@ -278,13 +294,21 @@ defmodule Membrane.VideoMixer.Filter do
         if primary_queue_size < state.primary_delay_frames do
           {[], state}
         else
-          input_order = input_order(state)
+          primary_role = pad_role!(state, :primary)
+          output_spec = Map.get(state.spec_by_role, primary_role)
 
-          if Enum.all?(input_order, &Map.has_key?(state.spec_by_role, &1)) do
-            {state, buffers} = mix_n(state, 1, [])
-            {[buffer: {:output, buffers}, redemand: :output], state}
-          else
+          if output_spec == nil do
             {[], state}
+          else
+            {layout_choice, state} = ensure_layout_choice(state, output_spec, false)
+            required_roles = required_roles(layout_choice, input_order(state))
+
+            if Enum.all?(required_roles, &Map.has_key?(state.spec_by_role, &1)) do
+              {state, buffers} = mix_n(state, 1, [])
+              {[buffer: {:output, buffers}, redemand: :output], state}
+            else
+              {[], state}
+            end
           end
         end
       end
@@ -298,7 +322,7 @@ defmodule Membrane.VideoMixer.Filter do
     mix_n(state, n - 1, [buffer | acc])
   end
 
-  defp mix(state = %{layout_builder: builder, mixer: mixer}) do
+  defp mix(state = %{mixer: mixer}) do
     {frames_with_spec, state} =
       state.pad_order
       |> Enum.filter(&Map.has_key?(state.queue_by_pad, &1))
@@ -327,28 +351,25 @@ defmodule Membrane.VideoMixer.Filter do
 
     {layout_choice, state} =
       if mixer == nil or specs_changed? do
-        layout_choice =
-          case state.layout_choice do
-            nil -> builder.(output_spec, specs_by_role, state.builder_state)
-            choice -> choice
-          end
-
-        {layout_choice, %{state | layout_choice: layout_choice}}
+        ensure_layout_choice(state, output_spec, true)
       else
         {state.layout_choice, state}
       end
 
+    required_roles = required_roles(layout_choice, input_order)
+    specs_for_mixer = specs_for_roles(specs_by_role, required_roles)
+
     mixer =
       if specs_changed? or mixer == nil do
-        specs = Enum.map(input_order, &Map.fetch!(specs_by_role, &1))
+        specs = Enum.map(required_roles, &Map.fetch!(specs_for_mixer, &1))
 
         case layout_choice do
           {:layout, layout} ->
-            {:ok, mixer} = VideoMixer.init(layout, specs_by_role, output_spec)
+            {:ok, mixer} = VideoMixer.init(layout, specs_for_mixer, output_spec)
             mixer
 
           {:raw, filter_graph} ->
-            {:ok, mixer} = VideoMixer.init_raw(filter_graph, specs, input_order, output_spec)
+            {:ok, mixer} = VideoMixer.init_raw(filter_graph, specs, required_roles, output_spec)
             mixer
 
           other ->
@@ -358,7 +379,9 @@ defmodule Membrane.VideoMixer.Filter do
         mixer
       end
 
-    {frames_by_name, state} = build_frames_by_role(state, input_order, popped_frames, primary_role)
+    {frames_by_name, state} =
+      build_frames_by_role(state, required_roles, popped_frames, primary_role)
+
     primary_frame = Map.fetch!(frames_by_name, primary_role)
     {:ok, raw_frame} = VideoMixer.mix(mixer, Map.to_list(frames_by_name))
 
@@ -406,20 +429,20 @@ defmodule Membrane.VideoMixer.Filter do
     if pad == :primary do
       state
     else
-    role =
-      case ctx.pad_options do
-        %{role: role} when is_atom(role) -> role
-        _ -> raise "dynamic input pads require :role option"
+      role =
+        case ctx.pad_options do
+          %{role: role} when is_atom(role) -> role
+          _ -> raise "dynamic input pads require :role option"
+        end
+
+      if Map.values(state.pad_roles) |> Enum.member?(role) do
+        raise "duplicate role #{inspect(role)} for pad #{inspect(pad)}"
       end
 
-    if Map.values(state.pad_roles) |> Enum.member?(role) do
-      raise "duplicate role #{inspect(role)} for pad #{inspect(pad)}"
-    end
-
-    state
-    |> init_frame_queue(pad)
-    |> update_in([:pad_roles], &Map.put(&1, pad, role))
-    |> update_in([:extra_queue_size_by_pad], &Map.put(&1, pad, extra_queue_size(ctx)))
+      state
+      |> init_frame_queue(pad)
+      |> update_in([:pad_roles], &Map.put(&1, pad, role))
+      |> update_in([:extra_queue_size_by_pad], &Map.put(&1, pad, extra_queue_size(ctx)))
     end
   end
 
@@ -432,13 +455,13 @@ defmodule Membrane.VideoMixer.Filter do
 
     cond do
       Map.has_key?(state.pad_roles, :primary) ->
-      state
+        state
 
       Map.values(state.pad_roles) |> Enum.member?(role) ->
         raise "duplicate role #{inspect(role)} for pad :primary"
 
       true ->
-      update_in(state, [:pad_roles], &Map.put(&1, :primary, role))
+        update_in(state, [:pad_roles], &Map.put(&1, :primary, role))
     end
   end
 
@@ -465,11 +488,16 @@ defmodule Membrane.VideoMixer.Filter do
         Map.put(acc, role, %{frame: frame, spec: spec})
       end)
 
+    state =
+      Enum.reduce(popped_frames, state, fn %{pad: pad, frame: frame}, state ->
+        role = pad_role!(state, pad)
+        update_in(state, [:last_frame_by_role], &Map.put(&1, role, frame))
+      end)
+
     {frames_by_name, state} =
       Enum.reduce(input_order, {%{}, state}, fn role, {frames_by_name, state} ->
         case popped_by_role do
           %{^role => %{frame: frame}} ->
-            state = update_in(state, [:last_frame_by_role], &Map.put(&1, role, frame))
             {Map.put(frames_by_name, role, frame), state}
 
           _ ->
@@ -540,10 +568,38 @@ defmodule Membrane.VideoMixer.Filter do
     end
   end
 
+  defp ensure_layout_choice(state = %{layout_builder: builder}, output_spec, force?) do
+    if force? or state.layout_choice == nil do
+      layout_choice = builder.(output_spec, state.spec_by_role, state.builder_state)
+      {layout_choice, %{state | layout_choice: layout_choice}}
+    else
+      {state.layout_choice, state}
+    end
+  end
+
+  defp required_roles({:layout, layout}, _input_order), do: layout_roles(layout)
+  defp required_roles({:raw, _filter_graph}, input_order), do: input_order
+
+  defp required_roles(other, _input_order),
+    do: raise("invalid layout_builder result: #{inspect(other)}")
+
+  defp specs_for_roles(specs_by_role, roles) do
+    Map.take(specs_by_role, roles)
+  end
+
+  defp layout_roles(:single_fit), do: [:primary]
+  defp layout_roles(:hstack), do: [:left, :right]
+  defp layout_roles(:vstack), do: [:top, :bottom]
+  defp layout_roles(:xstack), do: [:top_left, :top_right, :bottom_left, :bottom_right]
+  defp layout_roles(:primary_sidebar), do: [:primary, :sidebar]
+
+  defp layout_roles(other),
+    do: raise("invalid layout_builder result: #{inspect(other)}")
+
   defp maybe_drop_extra_frames(state, :primary), do: state
 
   defp maybe_drop_extra_frames(state, pad) do
-    if primary_stalled?(state) do
+    if primary_needs_frames?(state) do
       limit = Map.get(state.extra_queue_size_by_pad, pad, 1)
       queue = Map.get(state.queue_by_pad, pad)
       trimmed_queue = drop_oldest_ready(queue, limit)
@@ -562,10 +618,10 @@ defmodule Membrane.VideoMixer.Filter do
     end
   end
 
-  defp primary_stalled?(state) do
+  defp primary_needs_frames?(state) do
     case Map.get(state.queue_by_pad, :primary) do
       nil -> true
-      queue -> not FrameQueue.ready?(queue)
+      queue -> FrameQueue.size(queue) < state.primary_delay_frames
     end
   end
 end

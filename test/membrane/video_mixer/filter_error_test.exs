@@ -62,10 +62,6 @@ defmodule Membrane.VideoMixer.FilterErrorTest do
     assert_receive {:EXIT, ^supervisor, {:membrane_child_crash, :mixer, {%RuntimeError{message: "mixer inputs must provide a stable framerate"}, _}}}, 2000
   end
 
-  # NOTE: This test reveals a potential bug in the filter where buffers arrive
-  # and cause an error before the framerate mismatch can be detected in handle_stream_format.
-  # Skipping for now as it requires investigation of filter implementation.
-  @tag :skip
   test "raises on mismatched framerates" do
     width = 64
     height = 48
@@ -82,11 +78,11 @@ defmodule Membrane.VideoMixer.FilterErrorTest do
     spec = [
       child(:primary, %DynamicSource{output: {primary_state, primary_generator}, stream_format: format30fps})
       |> via_out(:output)
-      |> via_in(:primary)  # Uses default role :primary
+      |> via_in(:primary, options: [role: :left])  # hstack requires :left role
       |> child(:mixer, %Membrane.VideoMixer.Filter{layout_builder: layout_builder}),
       child(:secondary, %DynamicSource{output: {secondary_state, secondary_generator}, stream_format: format24fps})
       |> via_out(:output)
-      |> via_in(Membrane.Pad.ref(:input, 1), options: [role: :secondary])  # Must provide role for :input pads
+      |> via_in(Membrane.Pad.ref(:input, 1), options: [role: :right])  # hstack requires :right role
       |> get_child(:mixer),
       get_child(:mixer)
       |> child(:sink, Sink)

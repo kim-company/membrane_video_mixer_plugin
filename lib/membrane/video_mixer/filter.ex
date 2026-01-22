@@ -37,9 +37,8 @@ defmodule Membrane.VideoMixer.Filter do
   )
 
   def_input_pad(:primary,
-    flow_control: :manual,
+    flow_control: :auto,
     availability: :always,
-    demand_unit: :buffers,
     accepted_format: Membrane.RawVideo,
     options: [
       role: [spec: atom(), default: :primary],
@@ -48,9 +47,8 @@ defmodule Membrane.VideoMixer.Filter do
   )
 
   def_input_pad(:input,
-    flow_control: :manual,
+    flow_control: :auto,
     availability: :on_request,
-    demand_unit: :buffers,
     accepted_format: Membrane.RawVideo,
     options: [
       role: [spec: atom()],
@@ -59,9 +57,8 @@ defmodule Membrane.VideoMixer.Filter do
   )
 
   def_output_pad(:output,
-    flow_control: :manual,
+    flow_control: :auto,
     availability: :always,
-    demand_unit: :buffers,
     accepted_format: Membrane.RawVideo
   )
 
@@ -77,53 +74,29 @@ defmodule Membrane.VideoMixer.Filter do
       pad_order: [],
       pad_roles: %{},
       fit_mode_by_pad: %{},
-      active_pads: MapSet.new(),
-      spec_by_role: %{},
       closed?: false
     }
-
-    state = init_frame_queue(state, :primary)
 
     {[], state}
   end
 
   @impl true
   def handle_playing(_ctx, state) do
-    actions =
-      state.queue_by_pad
-      |> Map.keys()
-      |> Enum.map(fn pad -> {:demand, {pad, 1}} end)
-
-    {actions, state}
+    {[], state}
   end
 
   @impl true
   def handle_pad_added(pad, ctx, state) do
     state = register_pad_role!(state, pad, ctx)
-
-    actions =
-      if ctx.playback == :playing,
-        do: [demand: {pad, 1}],
-        else: []
-
-    {actions, state}
+    {[], state}
   end
 
   @impl true
-  def handle_pad_removed(pad, _ctx, state) do
-    role = pad_role!(state, pad)
-
-    state =
-      state
-      |> update_in([:queue_by_pad], &Map.delete(&1, pad))
-      |> update_in([:pad_order], &Enum.reject(&1, fn entry -> entry == pad end))
-      |> update_in([:pad_roles], &Map.delete(&1, pad))
-      |> update_in([:fit_mode_by_pad], &Map.delete(&1, pad))
-      |> update_in([:active_pads], &MapSet.delete(&1, pad))
-      |> update_in([:spec_by_role], &Map.delete(&1, role))
-      |> then(&%{&1 | mixer: nil, layout_choice: nil})
-
-    mix_or_drain(state)
+  def handle_pad_removed(_pad, _ctx, state) do
+    # A pad receives first the end_of_stream and then its removed. We don't have
+    # to worry about it now, we're going to handle pad removal once we pop the
+    # end_of_stream message from pad's frame queue.
+    {[], state}
   end
 
   @impl true
@@ -159,87 +132,32 @@ defmodule Membrane.VideoMixer.Filter do
     state =
       state
       |> put_in([:framerate], framerate)
-      |> put_in([:spec_by_role, role], frame_spec)
       |> update_in([:queue_by_pad, pad], &FrameQueue.push(&1, frame_spec))
 
-    base_actions = if pad == :primary, do: [stream_format: {:output, caps}], else: []
-    {mix_actions, state} = mix_or_drain(state)
-    {base_actions ++ mix_actions, state}
+    # Stream format will be emitted by mix/2 when popping from primary with spec_changed? == true
+    {[], state}
   end
 
   @impl true
-  def handle_demand(:output, _size, :buffers, _context, state) do
-    actions =
-      state.queue_by_pad
-      |> Enum.reject(fn {_pad, queue} -> FrameQueue.any?(queue) or FrameQueue.closed?(queue) end)
-      |> Enum.map(fn {pad, _queue} -> {:demand, {pad, 1}} end)
-
-    {actions, state}
-  end
-
-  @impl true
-  def handle_buffer(pad, buffer, _ctx, state) do
-    if primary_closed?(state) do
+  def handle_buffer(pad, buffer, ctx, state) do
+    # Ignore whatever we receive after we've sent end_of_stream
+    if stream_finished?(ctx) do
       {[], state}
     else
-      # Validate frame size matches current spec to avoid mismatches when resolution changes
-      role = pad_role!(state, pad)
-      current_spec = Map.get(state.spec_by_role, role)
-      frame_size = byte_size(buffer.payload)
+      frame = %Frame{pts: buffer.pts, data: buffer.payload, size: byte_size(buffer.payload)}
 
-      cond do
-        # No spec yet - queue the frame (first frame before stream_format)
-        current_spec == nil ->
-          frame = %Frame{pts: buffer.pts, data: buffer.payload, size: frame_size}
-          state = update_in(state, [:queue_by_pad, pad], &FrameQueue.push(&1, frame))
+      # Check if pad was ready before pushing
+      old_queue = state.queue_by_pad[pad]
+      was_ready = FrameQueue.ready?(old_queue)
 
-          # Pad becomes "active" on first frame
-          was_active = MapSet.member?(state.active_pads, pad)
-          state = update_in(state.active_pads, &MapSet.put(&1, pad))
+      state = update_in(state, [:queue_by_pad, pad], &FrameQueue.push(&1, frame))
 
-          # Rebuild layout if pad just became active
-          state = if not was_active, do: %{state | mixer: nil, layout_choice: nil}, else: state
+      # If this pad just became ready (received first frame), reset mixer state
+      # so layout is rebuilt to include this pad
+      queue = state.queue_by_pad[pad]
+      state = if not was_ready and FrameQueue.ready?(queue), do: reset_mixer_state(state), else: state
 
-          {actions, state} = mix_or_drain(state)
-
-          # Always redemand from the pad that sent us the buffer (keeps upstream flowing)
-          demand_action = if pad != :primary, do: [demand: {pad, 1}], else: []
-          {actions ++ demand_action, state}
-
-        # Frame size doesn't match current spec - drop it and demand another
-        # This can happen when a pad is removed and re-added with different resolution,
-        # and there are buffered frames from the old resolution still in flight
-        frame_size != current_spec.accepted_frame_size ->
-          require Logger
-
-          Logger.warning(
-            "Dropping frame from #{inspect(pad)} (role: #{inspect(role)}): " <>
-              "frame size #{frame_size} doesn't match expected size #{current_spec.accepted_frame_size} " <>
-              "(spec: #{current_spec.width}x#{current_spec.height})"
-          )
-
-          # Just demand another frame
-          demand_action = if pad != :primary, do: [demand: {pad, 1}], else: []
-          {demand_action, state}
-
-        # Frame size matches - proceed normally
-        true ->
-          frame = %Frame{pts: buffer.pts, data: buffer.payload, size: frame_size}
-          state = update_in(state, [:queue_by_pad, pad], &FrameQueue.push(&1, frame))
-
-          # Pad becomes "active" on first frame
-          was_active = MapSet.member?(state.active_pads, pad)
-          state = update_in(state.active_pads, &MapSet.put(&1, pad))
-
-          # Rebuild layout if pad just became active
-          state = if not was_active, do: %{state | mixer: nil, layout_choice: nil}, else: state
-
-          {actions, state} = mix_or_drain(state)
-
-          # Always redemand from the pad that sent us the buffer (keeps upstream flowing)
-          demand_action = if pad != :primary, do: [demand: {pad, 1}], else: []
-          {actions ++ demand_action, state}
-      end
+      mix_or_drain(state)
     end
   end
 
@@ -252,6 +170,10 @@ defmodule Membrane.VideoMixer.Filter do
     {[], %{state | mixer: nil, layout_choice: nil, builder_state: builder_state}}
   end
 
+  defp stream_finished?(ctx) do
+    ctx.pads.output.end_of_stream?
+  end
+
   defp primary_closed?(state) do
     case get_in(state, [:queue_by_pad, :primary]) do
       nil -> false
@@ -259,17 +181,6 @@ defmodule Membrane.VideoMixer.Filter do
     end
   end
 
-  defp primary_has_frame?(state) do
-    case Map.get(state.queue_by_pad, :primary) do
-      nil -> false
-      queue -> FrameQueue.any?(queue)
-    end
-  end
-
-  defp has_primary_spec?(state) do
-    primary_role = Map.get(state.pad_roles, :primary)
-    primary_role != nil and Map.has_key?(state.spec_by_role, primary_role)
-  end
 
   defp all_have_frames?(pads, state) do
     Enum.all?(pads, fn pad ->
@@ -279,104 +190,157 @@ defmodule Membrane.VideoMixer.Filter do
   end
 
   defp required_pads(layout_choice, state) do
-    required_roles = required_roles(layout_choice, input_order(state))
+    required_roles = required_roles(layout_choice, input_order(state), state)
 
     Enum.map(required_roles, fn role ->
       Enum.find(state.pad_roles, fn {_pad, r} -> r == role end) |> elem(0)
     end)
   end
 
-  defp drain_all_extras(state) do
+  defp get_active_pads(state) do
     state.queue_by_pad
-    |> Enum.reject(fn {pad, _} -> pad == :primary end)
-    |> Enum.reduce({[], state}, fn {pad, _}, {actions, state} ->
-      drain_one_frame(pad, actions, state)
+    |> Enum.filter(fn {_pad, queue} ->
+      FrameQueue.ready?(queue) and not FrameQueue.closed?(queue)
     end)
+    |> Enum.map(fn {pad, _} -> pad end)
   end
 
   defp drain_non_required(state, required_pads) do
     required_set = MapSet.new(required_pads)
+
     state.queue_by_pad
     |> Enum.reject(fn {pad, _} -> MapSet.member?(required_set, pad) end)
-    |> Enum.reduce({[], state}, fn {pad, _}, {actions, state} ->
-      drain_one_frame(pad, actions, state)
+    |> Enum.reduce(state, fn {pad, _}, state ->
+      drain_queue_completely(state, pad)
     end)
   end
 
-  # Returns {additional_actions, state}
-  defp drain_one_frame(pad, actions, state) do
+  defp drain_queue_completely(state, pad) do
     queue = state.queue_by_pad[pad]
+
     if FrameQueue.any?(queue) do
       {_dropped, queue} = FrameQueue.pop!(queue)
       state = put_in(state, [:queue_by_pad, pad], queue)
-      # MUST redemand to flush upstream Membrane buffers!
-      {actions ++ [demand: {pad, 1}], state}
+      drain_queue_completely(state, pad)
     else
-      {actions, state}
+      state
     end
+  end
+
+  defp build_specs_from_pads(state, pads) do
+    pads
+    |> Enum.map(fn pad ->
+      queue = state.queue_by_pad[pad]
+      role = pad_role!(state, pad)
+      {role, queue.current_spec}
+    end)
+    |> Enum.reject(fn {_role, spec} -> spec == nil end)
+    |> Map.new()
+  end
+
+  defp spec_to_raw_video(spec, framerate) do
+    %Membrane.RawVideo{
+      width: spec.width,
+      height: spec.height,
+      pixel_format: spec.pixel_format,
+      framerate: framerate,
+      aligned: true
+    }
+  end
+
+  defp any_spec_changed?(popped_by_pad) do
+    Enum.any?(popped_by_pad, fn {_pad, popped} -> popped.spec_changed? end)
+  end
+
+  defp pop_from_all(required_pads, state) do
+    Enum.reduce(required_pads, {%{}, state}, fn pad, {acc, state} ->
+      {popped, queue} = FrameQueue.pop!(state.queue_by_pad[pad])
+      state = put_in(state, [:queue_by_pad, pad], queue)
+      {Map.put(acc, pad, popped), state}
+    end)
   end
 
   defp mix_or_drain(state) do
     cond do
-      # Primary closed -> end stream
-      primary_closed?(state) and not state.closed? ->
-        {[end_of_stream: :output], %{state | closed?: true}}
-
-      # Primary has no frames -> drain all extras (and redemand!)
-      not primary_has_frame?(state) ->
-        {drain_actions, state} = drain_all_extras(state)
-        {drain_actions, state}
-
-      # No primary spec yet -> wait for it to be popped
-      not has_primary_spec?(state) ->
+      # Already sent end_of_stream, don't send again
+      state.closed? ->
         {[], state}
 
-      # Get layout, check if all required pads have frames
+      # Primary closed -> end stream
+      primary_closed?(state) ->
+        {[end_of_stream: :output], %{state | closed?: true}}
+
       true ->
-        {layout_choice, state} = ensure_layout_choice(state)
+        mix(state, [])
+    end
+  end
+
+  defp mix(state, acc_actions) do
+    # 1. Get active pads (ready? and not closed?)
+    active_pads = get_active_pads(state)
+
+    # 2. Ensure layout exists (build from current_spec if nil)
+    #    Returns nil if we can't build a layout (no active pads with specs)
+    case ensure_layout(state, active_pads) do
+      {nil, state} ->
+        # Can't build layout yet, nothing to mix
+        {acc_actions, state}
+
+      {layout_choice, state} ->
+        # 3. Get required pads from layout
         required_pads = required_pads(layout_choice, state)
 
-        if all_have_frames?(required_pads, state) do
-          {state, buffer} = mix(state, required_pads)
-          {drain_actions, state} = drain_non_required(state, required_pads)
-          {[buffer: {:output, [buffer]}, redemand: :output] ++ drain_actions, state}
+        # 4. Drain completely all queues NOT in required_pads
+        state = drain_non_required(state, required_pads)
+
+        # 5. Check if all required have frames
+        if not all_have_frames?(required_pads, state) do
+          {acc_actions, state}
         else
-          {drain_actions, state} = drain_non_required(state, required_pads)
-          {drain_actions, state}
+          # 6. Pop from all required pads
+          {popped_by_pad, state} = pop_from_all(required_pads, state)
+
+          # 7. Check if any spec changed
+          specs_changed? = any_spec_changed?(popped_by_pad)
+
+          # 8. If primary's spec changed, emit new stream_format
+          primary_spec_changed? = popped_by_pad[:primary] && popped_by_pad[:primary].spec_changed?
+
+          stream_format_action =
+            if primary_spec_changed? do
+              primary_spec = popped_by_pad[:primary].spec
+              [stream_format: {:output, spec_to_raw_video(primary_spec, state.framerate)}]
+            else
+              []
+            end
+
+          # 9. Do actual mixing (rebuilds mixer if specs_changed? or mixer is nil)
+          #    Uses current layout_choice which is still valid
+          {state, buffer} = do_mix(state, popped_by_pad, specs_changed?)
+
+          # 10. AFTER mixing: if specs changed, reset layout for NEXT iteration
+          #     This invalidates layout_choice so it's rebuilt from (potentially changed) active pads
+          #     Also invalidates mixer so it's rebuilt with the new layout
+          state = if specs_changed?, do: reset_mixer_state(state), else: state
+
+          # 11. Accumulate actions and recurse
+          new_actions = stream_format_action ++ [buffer: {:output, buffer}]
+          mix(state, acc_actions ++ new_actions)
         end
     end
   end
 
-  defp mix(state, required_pads) do
-    # Pop one item from each required pad, update spec_by_role if spec popped
-    {popped_by_pad, state} =
-      Enum.reduce(required_pads, {%{}, state}, fn pad, {acc, state} ->
-        {popped, queue} = FrameQueue.pop!(state.queue_by_pad[pad])
-        state = put_in(state, [:queue_by_pad, pad], queue)
-
-        # Update spec_by_role when spec changes (popped includes spec_changed? flag)
-        state =
-          if popped.spec_changed? do
-            role = pad_role!(state, pad)
-            put_in(state, [:spec_by_role, role], popped.spec)
-          else
-            state
-          end
-
-        {Map.put(acc, pad, popped), state}
+  defp do_mix(state, popped_by_pad, specs_changed?) do
+    # Build specs and frames maps
+    frames_by_role =
+      Map.new(popped_by_pad, fn {pad, p} ->
+        {pad_role!(state, pad), p.frame}
       end)
 
-    # Check if mixer needs rebuild
-    specs_changed? = Enum.any?(popped_by_pad, fn {_, p} -> p.spec_changed? end)
-
-    # Build specs and frames maps
-    frames_by_role = Map.new(popped_by_pad, fn {pad, p} ->
-      {pad_role!(state, pad), p.frame}
-    end)
-
-    specs_by_role = Map.new(popped_by_pad, fn {pad, p} ->
-      {pad_role!(state, pad), p.spec}
-    end)
+    specs_by_role =
+      Map.new(popped_by_pad, fn {pad, p} ->
+        {pad_role!(state, pad), p.spec}
+      end)
 
     primary_role = pad_role!(state, :primary)
     output_spec = Map.fetch!(specs_by_role, primary_role)
@@ -384,10 +348,15 @@ defmodule Membrane.VideoMixer.Filter do
     # Rebuild mixer if needed
     mixer =
       if specs_changed? or state.mixer == nil do
+        required_pads = Map.keys(popped_by_pad)
+
         case state.layout_choice do
           {:layout, layout} ->
-            {:ok, m} = VideoMixer.init(layout, specs_by_role, output_spec)
+            # Normalize role names to match VideoMixer expectations
+            normalized_specs = normalize_specs_for_layout(specs_by_role, layout, state)
+            {:ok, m} = VideoMixer.init(layout, normalized_specs, output_spec)
             m
+
           {:raw, filter_graph} ->
             specs = Enum.map(required_pads, &Map.fetch!(specs_by_role, pad_role!(state, &1)))
             roles = Enum.map(required_pads, &pad_role!(state, &1))
@@ -398,7 +367,17 @@ defmodule Membrane.VideoMixer.Filter do
         state.mixer
       end
 
-    case VideoMixer.mix(mixer, Map.to_list(frames_by_role)) do
+    # Normalize frames_by_role to match VideoMixer expectations
+    normalized_frames =
+      case state.layout_choice do
+        {:layout, layout} ->
+          normalize_frames_for_layout(frames_by_role, layout, state)
+
+        {:raw, _} ->
+          frames_by_role
+      end
+
+    case VideoMixer.mix(mixer, Map.to_list(normalized_frames)) do
       {:ok, raw_frame} ->
         buffer = %Membrane.Buffer{payload: raw_frame, pts: frames_by_role[primary_role].pts}
         {%{state | mixer: mixer}, buffer}
@@ -455,36 +434,28 @@ defmodule Membrane.VideoMixer.Filter do
   end
 
   defp register_pad_role!(state, pad, ctx) do
-    if pad == :primary do
-      state
-    else
-      role =
-        case ctx.pad_options do
-          %{role: role} when is_atom(role) -> role
-          _ -> raise "dynamic input pads require :role option"
-        end
-
-      fit_mode = Map.get(ctx.pad_options, :fit_mode, :crop)
-
-      if Map.values(state.pad_roles) |> Enum.member?(role) do
-        raise "duplicate role #{inspect(role)} for pad #{inspect(pad)}"
+    role =
+      case ctx.pad_options do
+        %{role: role} when is_atom(role) -> role
+        _ -> raise "dynamic input pads require :role option"
       end
 
-      state
-      |> init_frame_queue(pad)
-      |> update_in([:pad_roles], &Map.put(&1, pad, role))
-      |> update_in([:fit_mode_by_pad], &Map.put(&1, pad, fit_mode))
+    fit_mode = Map.get(ctx.pad_options, :fit_mode, :crop)
+
+    if Map.values(state.pad_roles) |> Enum.member?(role) do
+      raise "duplicate role #{inspect(role)} for pad #{inspect(pad)}"
     end
+
+    state
+    |> init_frame_queue(pad)
+    |> update_in([:pad_roles], &Map.put(&1, pad, role))
+    |> update_in([:fit_mode_by_pad], &Map.put(&1, pad, fit_mode))
   end
 
   defp ensure_primary_role(state, :primary, ctx) do
-    primary_options =
-      ctx.pads
-      |> Map.get(:primary, %{})
-      |> Map.get(:options, %{})
-
-    role = Map.get(primary_options, :role, :primary)
-    fit_mode = Map.get(primary_options, :fit_mode, :crop)
+    pad_options = ctx.pads.primary.options
+    role = Map.get(pad_options, :role, :primary)
+    fit_mode = Map.get(pad_options, :fit_mode, :crop)
 
     cond do
       Map.has_key?(state.pad_roles, :primary) ->
@@ -495,6 +466,7 @@ defmodule Membrane.VideoMixer.Filter do
 
       true ->
         state
+        |> init_frame_queue(:primary)
         |> update_in([:pad_roles], &Map.put(&1, :primary, role))
         |> update_in([:fit_mode_by_pad], &Map.put(&1, :primary, fit_mode))
     end
@@ -516,29 +488,100 @@ defmodule Membrane.VideoMixer.Filter do
     |> Enum.map(&pad_role!(state, &1))
   end
 
-  defp ensure_layout_choice(state) do
-    if state.layout_choice != nil do
-      {state.layout_choice, state}
-    else
-      primary_role = pad_role!(state, :primary)
-      output_spec = Map.fetch!(state.spec_by_role, primary_role)
-      layout_choice = state.layout_builder.(output_spec, state.spec_by_role, state.builder_state)
-      {layout_choice, %{state | layout_choice: layout_choice}}
+  defp ensure_layout(state, active_pads) do
+    cond do
+      # Use cached layout if available
+      state.layout_choice != nil ->
+        {state.layout_choice, state}
+
+      # Can't build layout without active pads with specs
+      active_pads == [] ->
+        {nil, state}
+
+      # Can't build layout if primary role not registered yet
+      not Map.has_key?(state.pad_roles, :primary) ->
+        {nil, state}
+
+      true ->
+        specs_by_role = build_specs_from_pads(state, active_pads)
+        primary_role = pad_role!(state, :primary)
+
+        case Map.fetch(specs_by_role, primary_role) do
+          {:ok, output_spec} ->
+            layout_choice = state.layout_builder.(output_spec, specs_by_role, state.builder_state)
+            {layout_choice, %{state | layout_choice: layout_choice}}
+
+          :error ->
+            # Primary doesn't have a spec yet
+            {nil, state}
+        end
     end
   end
 
-  defp required_roles({:layout, layout}, _input_order), do: layout_roles(layout)
-  defp required_roles({:raw, _filter_graph}, input_order), do: input_order
+  defp reset_mixer_state(state) do
+    state
+    |> put_in([:mixer], nil)
+    |> put_in([:layout_choice], nil)
+  end
 
-  defp required_roles(other, _input_order),
+  defp required_roles({:layout, layout}, _input_order, state), do: layout_roles(layout, state)
+  defp required_roles({:raw, _filter_graph}, input_order, _state), do: input_order
+
+  defp required_roles(other, _input_order, _state),
     do: raise("invalid layout_builder result: #{inspect(other)}")
 
-  defp layout_roles(:single_fit), do: [:primary]
-  defp layout_roles(:hstack), do: [:left, :right]
-  defp layout_roles(:vstack), do: [:top, :bottom]
-  defp layout_roles(:xstack), do: [:top_left, :top_right, :bottom_left, :bottom_right]
-  defp layout_roles(:primary_sidebar), do: [:primary, :sidebar]
+  defp layout_roles(:single_fit, state) do
+    # Use the actual primary role instead of hardcoded :primary
+    [pad_role!(state, :primary)]
+  end
 
-  defp layout_roles(other),
+  defp layout_roles(:hstack, _state), do: [:left, :right]
+  defp layout_roles(:vstack, _state), do: [:top, :bottom]
+  defp layout_roles(:xstack, _state), do: [:top_left, :top_right, :bottom_left, :bottom_right]
+
+  defp layout_roles(:primary_sidebar, state) do
+    # Use actual primary role for primary_sidebar too
+    [pad_role!(state, :primary), :sidebar]
+  end
+
+  defp layout_roles(other, _state),
     do: raise("invalid layout_builder result: #{inspect(other)}")
+
+  # Normalize role names to match VideoMixer's expectations for preset layouts
+  defp normalize_specs_for_layout(specs_by_role, layout, state) when layout in [:single_fit, :primary_sidebar] do
+    # These layouts expect a role named :primary, but user may have used a custom role
+    actual_primary_role = pad_role!(state, :primary)
+
+    # If the primary already uses :primary role, no need to normalize
+    if actual_primary_role == :primary do
+      specs_by_role
+    else
+      # Rename the actual primary role to :primary for VideoMixer
+      specs_by_role
+      |> Map.delete(actual_primary_role)
+      |> Map.put(:primary, specs_by_role[actual_primary_role])
+    end
+  end
+
+  defp normalize_specs_for_layout(specs_by_role, _layout, _state) do
+    # Other layouts (hstack, vstack, xstack) use their predefined role names
+    specs_by_role
+  end
+
+  # Normalize frame role names to match VideoMixer's expectations
+  defp normalize_frames_for_layout(frames_by_role, layout, state) when layout in [:single_fit, :primary_sidebar] do
+    actual_primary_role = pad_role!(state, :primary)
+
+    if actual_primary_role == :primary do
+      frames_by_role
+    else
+      frames_by_role
+      |> Map.delete(actual_primary_role)
+      |> Map.put(:primary, frames_by_role[actual_primary_role])
+    end
+  end
+
+  defp normalize_frames_for_layout(frames_by_role, _layout, _state) do
+    frames_by_role
+  end
 end

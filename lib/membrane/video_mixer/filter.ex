@@ -18,7 +18,9 @@ defmodule Membrane.VideoMixer.Filter do
           (output_spec :: FrameSpec.t(),
            inputs :: %{atom() => FrameSpec.t()},
            builder_state :: any ->
-             {:layout, VideoMixer.FilterGraph.layout()} | {:raw, VideoMixer.filter_graph_t()})
+             {:layout, VideoMixer.FilterGraph.layout()}
+             | {:layout, VideoMixer.FilterGraph.layout(), slot_mapping :: %{atom() => atom()}}
+             | {:raw, VideoMixer.filter_graph_t()})
 
   def_options(
     layout_builder: [
@@ -69,6 +71,7 @@ defmodule Membrane.VideoMixer.Filter do
       builder_state: opts.builder_state,
       mixer: nil,
       layout_choice: nil,
+      slot_mapping: %{},
       framerate: nil,
       queue_by_pad: %{},
       pad_order: [],
@@ -508,8 +511,19 @@ defmodule Membrane.VideoMixer.Filter do
 
         case Map.fetch(specs_by_role, primary_role) do
           {:ok, output_spec} ->
-            layout_choice = state.layout_builder.(output_spec, specs_by_role, state.builder_state)
-            {layout_choice, %{state | layout_choice: layout_choice}}
+            case state.layout_builder.(output_spec, specs_by_role, state.builder_state) do
+              {:layout, layout, slot_mapping} ->
+                validate_slot_mapping!(layout, slot_mapping, specs_by_role)
+                layout_choice = {:layout, layout}
+                {layout_choice, %{state | layout_choice: layout_choice, slot_mapping: slot_mapping}}
+
+              {:layout, layout} ->
+                layout_choice = {:layout, layout}
+                {layout_choice, %{state | layout_choice: layout_choice, slot_mapping: %{}}}
+
+              {:raw, _} = raw ->
+                {raw, %{state | layout_choice: raw, slot_mapping: %{}}}
+            end
 
           :error ->
             # Primary doesn't have a spec yet
@@ -522,6 +536,42 @@ defmodule Membrane.VideoMixer.Filter do
     state
     |> put_in([:mixer], nil)
     |> put_in([:layout_choice], nil)
+    |> put_in([:slot_mapping], %{})
+  end
+
+  defp layout_slot_order(:single_fit, _state), do: [:primary]
+  defp layout_slot_order(:hstack, _state), do: [:left, :right]
+  defp layout_slot_order(:vstack, _state), do: [:top, :bottom]
+  defp layout_slot_order(:xstack, _state), do: [:top_left, :top_right, :bottom_left, :bottom_right]
+  defp layout_slot_order(:primary_sidebar, _state), do: [:primary, :sidebar]
+
+  defp layout_slot_order(other, _state),
+    do: raise("invalid layout: #{inspect(other)}")
+
+  defp resolve_slot(slot_name, state) do
+    case Map.get(state.slot_mapping, slot_name) do
+      nil ->
+        # No mapping - default behavior
+        if slot_name == :primary, do: pad_role!(state, :primary), else: slot_name
+
+      user_role ->
+        user_role
+    end
+  end
+
+  defp validate_slot_mapping!(layout, slot_mapping, specs_by_role) do
+    available_roles = Map.keys(specs_by_role)
+    valid_slots = layout_slot_order(layout, nil)
+
+    Enum.each(slot_mapping, fn {slot, role} ->
+      unless slot in valid_slots do
+        raise "invalid slot #{inspect(slot)} for layout #{inspect(layout)}. Valid slots: #{inspect(valid_slots)}"
+      end
+
+      unless role in available_roles do
+        raise "slot mapping #{inspect(slot)} -> #{inspect(role)} refers to unavailable role. Available: #{inspect(available_roles)}"
+      end
+    end)
   end
 
   defp required_roles({:layout, layout}, _input_order, state), do: layout_roles(layout, state)
@@ -530,58 +580,43 @@ defmodule Membrane.VideoMixer.Filter do
   defp required_roles(other, _input_order, _state),
     do: raise("invalid layout_builder result: #{inspect(other)}")
 
-  defp layout_roles(:single_fit, state) do
-    # Use the actual primary role instead of hardcoded :primary
-    [pad_role!(state, :primary)]
+  defp layout_roles(:single_fit, state), do: [resolve_slot(:primary, state)]
+  defp layout_roles(:hstack, state), do: [resolve_slot(:left, state), resolve_slot(:right, state)]
+  defp layout_roles(:vstack, state), do: [resolve_slot(:top, state), resolve_slot(:bottom, state)]
+
+  defp layout_roles(:xstack, state) do
+    [
+      resolve_slot(:top_left, state),
+      resolve_slot(:top_right, state),
+      resolve_slot(:bottom_left, state),
+      resolve_slot(:bottom_right, state)
+    ]
   end
 
-  defp layout_roles(:hstack, _state), do: [:left, :right]
-  defp layout_roles(:vstack, _state), do: [:top, :bottom]
-  defp layout_roles(:xstack, _state), do: [:top_left, :top_right, :bottom_left, :bottom_right]
-
   defp layout_roles(:primary_sidebar, state) do
-    # Use actual primary role for primary_sidebar too
-    [pad_role!(state, :primary), :sidebar]
+    [resolve_slot(:primary, state), resolve_slot(:sidebar, state)]
   end
 
   defp layout_roles(other, _state),
     do: raise("invalid layout_builder result: #{inspect(other)}")
 
   # Normalize role names to match VideoMixer's expectations for preset layouts
-  defp normalize_specs_for_layout(specs_by_role, layout, state) when layout in [:single_fit, :primary_sidebar] do
-    # These layouts expect a role named :primary, but user may have used a custom role
-    actual_primary_role = pad_role!(state, :primary)
-
-    # If the primary already uses :primary role, no need to normalize
-    if actual_primary_role == :primary do
-      specs_by_role
-    else
-      # Rename the actual primary role to :primary for VideoMixer
-      specs_by_role
-      |> Map.delete(actual_primary_role)
-      |> Map.put(:primary, specs_by_role[actual_primary_role])
-    end
-  end
-
-  defp normalize_specs_for_layout(specs_by_role, _layout, _state) do
-    # Other layouts (hstack, vstack, xstack) use their predefined role names
-    specs_by_role
+  defp normalize_specs_for_layout(specs_by_role, layout, state) do
+    layout_slot_order(layout, state)
+    |> Enum.map(fn slot_name ->
+      user_role = resolve_slot(slot_name, state)
+      {slot_name, Map.fetch!(specs_by_role, user_role)}
+    end)
+    |> Map.new()
   end
 
   # Normalize frame role names to match VideoMixer's expectations
-  defp normalize_frames_for_layout(frames_by_role, layout, state) when layout in [:single_fit, :primary_sidebar] do
-    actual_primary_role = pad_role!(state, :primary)
-
-    if actual_primary_role == :primary do
-      frames_by_role
-    else
-      frames_by_role
-      |> Map.delete(actual_primary_role)
-      |> Map.put(:primary, frames_by_role[actual_primary_role])
-    end
-  end
-
-  defp normalize_frames_for_layout(frames_by_role, _layout, _state) do
-    frames_by_role
+  defp normalize_frames_for_layout(frames_by_role, layout, state) do
+    layout_slot_order(layout, state)
+    |> Enum.map(fn slot_name ->
+      user_role = resolve_slot(slot_name, state)
+      {slot_name, Map.fetch!(frames_by_role, user_role)}
+    end)
+    |> Map.new()
   end
 end

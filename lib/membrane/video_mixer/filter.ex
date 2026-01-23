@@ -16,10 +16,10 @@ defmodule Membrane.VideoMixer.Filter do
 
   @type layout_builder_t ::
           (output_spec :: FrameSpec.t(),
-           inputs :: %{atom() => FrameSpec.t()},
+           inputs :: %{any() => FrameSpec.t()},
            builder_state :: any ->
              {:layout, VideoMixer.FilterGraph.layout()}
-             | {:layout, VideoMixer.FilterGraph.layout(), slot_mapping :: %{atom() => atom()}}
+             | {:layout, VideoMixer.FilterGraph.layout(), slot_mapping :: %{atom() => any()}}
              | {:raw, VideoMixer.filter_graph_t()})
 
   def_options(
@@ -53,7 +53,7 @@ defmodule Membrane.VideoMixer.Filter do
     availability: :on_request,
     accepted_format: Membrane.RawVideo,
     options: [
-      role: [spec: atom()],
+      role: [spec: any(), default: nil],
       fit_mode: [spec: :crop | :fit, default: :crop]
     ]
   )
@@ -285,11 +285,11 @@ defmodule Membrane.VideoMixer.Filter do
     # 2. Ensure layout exists (build from current_spec if nil)
     #    Returns nil if we can't build a layout (no active pads with specs)
     case ensure_layout(state, active_pads) do
-      {nil, state} ->
+      {nil, state, _actions} ->
         # Can't build layout yet, nothing to mix
         {acc_actions, state}
 
-      {layout_choice, state} ->
+      {layout_choice, state, layout_actions} ->
         # 3. Get required pads from layout
         required_pads = required_pads(layout_choice, state)
 
@@ -298,7 +298,7 @@ defmodule Membrane.VideoMixer.Filter do
 
         # 5. Check if all required have frames
         if not all_have_frames?(required_pads, state) do
-          {acc_actions, state}
+          {acc_actions ++ layout_actions, state}
         else
           # 6. Pop from all required pads
           {popped_by_pad, state} = pop_from_all(required_pads, state)
@@ -327,7 +327,7 @@ defmodule Membrane.VideoMixer.Filter do
           state = if specs_changed?, do: reset_mixer_state(state), else: state
 
           # 11. Accumulate actions and recurse
-          new_actions = stream_format_action ++ [buffer: {:output, buffer}]
+          new_actions = layout_actions ++ stream_format_action ++ [buffer: {:output, buffer}]
           mix(state, acc_actions ++ new_actions)
         end
     end
@@ -439,8 +439,8 @@ defmodule Membrane.VideoMixer.Filter do
   defp register_pad_role!(state, pad, ctx) do
     role =
       case ctx.pad_options do
-        %{role: role} when is_atom(role) -> role
-        _ -> raise "dynamic input pads require :role option"
+        %{role: role} when not is_nil(role) -> role
+        _ -> pad_id(pad)
       end
 
     fit_mode = Map.get(ctx.pad_options, :fit_mode, :crop)
@@ -454,6 +454,8 @@ defmodule Membrane.VideoMixer.Filter do
     |> update_in([:pad_roles], &Map.put(&1, pad, role))
     |> update_in([:fit_mode_by_pad], &Map.put(&1, pad, fit_mode))
   end
+
+  defp pad_id(Membrane.Pad.ref(:input, id)), do: id
 
   defp ensure_primary_role(state, :primary, ctx) do
     pad_options = ctx.pads.primary.options
@@ -495,15 +497,15 @@ defmodule Membrane.VideoMixer.Filter do
     cond do
       # Use cached layout if available
       state.layout_choice != nil ->
-        {state.layout_choice, state}
+        {state.layout_choice, state, []}
 
       # Can't build layout without active pads with specs
       active_pads == [] ->
-        {nil, state}
+        {nil, state, []}
 
       # Can't build layout if primary role not registered yet
       not Map.has_key?(state.pad_roles, :primary) ->
-        {nil, state}
+        {nil, state, []}
 
       true ->
         specs_by_role = build_specs_from_pads(state, active_pads)
@@ -515,19 +517,25 @@ defmodule Membrane.VideoMixer.Filter do
               {:layout, layout, slot_mapping} ->
                 validate_slot_mapping!(layout, slot_mapping, specs_by_role)
                 layout_choice = {:layout, layout}
-                {layout_choice, %{state | layout_choice: layout_choice, slot_mapping: slot_mapping}}
+                new_state = %{state | layout_choice: layout_choice, slot_mapping: slot_mapping}
+                notification = build_layout_notification(layout_choice, new_state, active_pads)
+                {layout_choice, new_state, [notify_parent: notification]}
 
               {:layout, layout} ->
                 layout_choice = {:layout, layout}
-                {layout_choice, %{state | layout_choice: layout_choice, slot_mapping: %{}}}
+                new_state = %{state | layout_choice: layout_choice, slot_mapping: %{}}
+                notification = build_layout_notification(layout_choice, new_state, active_pads)
+                {layout_choice, new_state, [notify_parent: notification]}
 
               {:raw, _} = raw ->
-                {raw, %{state | layout_choice: raw, slot_mapping: %{}}}
+                new_state = %{state | layout_choice: raw, slot_mapping: %{}}
+                notification = build_layout_notification(raw, new_state, active_pads)
+                {raw, new_state, [notify_parent: notification]}
             end
 
           :error ->
             # Primary doesn't have a spec yet
-            {nil, state}
+            {nil, state, []}
         end
     end
   end
@@ -537,6 +545,39 @@ defmodule Membrane.VideoMixer.Filter do
     |> put_in([:mixer], nil)
     |> put_in([:layout_choice], nil)
     |> put_in([:slot_mapping], %{})
+  end
+
+  defp build_layout_notification({:layout, layout}, state, active_pads) do
+    # Build reverse mapping: role -> slot
+    role_to_slot =
+      layout_slot_order(layout, state)
+      |> Enum.map(fn slot ->
+        role = resolve_slot(slot, state)
+        {role, slot}
+      end)
+      |> Map.new()
+
+    # Build pad -> slot mapping for active pads (nil if not in layout)
+    slots =
+      active_pads
+      |> Enum.map(fn pad ->
+        role = pad_role!(state, pad)
+        slot = Map.get(role_to_slot, role)
+        {pad, slot}
+      end)
+      |> Map.new()
+
+    {:layout_updated, %{layout: layout, slots: slots}}
+  end
+
+  defp build_layout_notification({:raw, _filter_graph}, _state, active_pads) do
+    # For raw filter graphs, all pads participate but no slot names
+    slots =
+      active_pads
+      |> Enum.map(fn pad -> {pad, nil} end)
+      |> Map.new()
+
+    {:layout_updated, %{layout: :raw, slots: slots}}
   end
 
   defp layout_slot_order(:single_fit, _state), do: [:primary]

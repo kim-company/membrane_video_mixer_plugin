@@ -191,7 +191,107 @@ defmodule Membrane.VideoMixer.FilterSlotMappingTest do
     assert message =~ "slot mapping :sidebar -> :nonexistent_role refers to unavailable role"
   end
 
+  test "pad ID used as implicit role when role not specified" do
+    width = 64
+    height = 48
+    format = FrameGenerator.stream_format(width, height, framerate: {30, 1}, pixel_format: :I420)
+    {green_state, green_generator} = FrameGenerator.green_generator(format)
+    {red_state, red_generator} = FrameGenerator.red_generator(format)
+
+    # Layout builder that uses pad ID directly in mapping (no explicit role)
+    layout_builder = fn _output_spec, specs_by_role, _builder_state ->
+      if Map.has_key?(specs_by_role, "conn_123") do
+        {:layout, :primary_sidebar, %{sidebar: "conn_123"}}
+      else
+        {:layout, :single_fit}
+      end
+    end
+
+    spec = [
+      child(:primary, %DynamicSource{output: {green_state, green_generator}, stream_format: format})
+      |> via_out(:output)
+      |> via_in(:primary, options: [role: :primary])
+      |> child(:mixer, %Membrane.VideoMixer.Filter{layout_builder: layout_builder}),
+      child(:sidebar_source, %DynamicSource{output: {red_state, red_generator}, stream_format: format})
+      |> via_out(:output)
+      |> via_in(Membrane.Pad.ref(:input, "conn_123"))
+      |> get_child(:mixer),
+      get_child(:mixer)
+      |> child(:sink, Sink)
+    ]
+
+    pipeline = Pipeline.start_link_supervised!(spec: spec)
+
+    # Wait for the primary_sidebar layout with pad ID as implicit role
+    _buffer = await_matching_buffer(pipeline, format, &primary_sidebar_green_red?/2)
+
+    Pipeline.terminate(pipeline)
+  end
+
+  test "layout_updated notification emitted when layout is consolidated" do
+    width = 64
+    height = 48
+    format = FrameGenerator.stream_format(width, height, framerate: {30, 1}, pixel_format: :I420)
+    {green_state, green_generator} = FrameGenerator.green_generator(format)
+    {red_state, red_generator} = FrameGenerator.red_generator(format)
+
+    # Layout builder that uses slot mapping
+    layout_builder = fn _output_spec, specs_by_role, _builder_state ->
+      if Map.has_key?(specs_by_role, :custom_role) do
+        {:layout, :primary_sidebar, %{sidebar: :custom_role}}
+      else
+        {:layout, :single_fit}
+      end
+    end
+
+    spec = [
+      child(:primary, %DynamicSource{output: {green_state, green_generator}, stream_format: format})
+      |> via_out(:output)
+      |> via_in(:primary, options: [role: :primary])
+      |> child(:mixer, %Membrane.VideoMixer.Filter{layout_builder: layout_builder}),
+      child(:sidebar_source, %DynamicSource{output: {red_state, red_generator}, stream_format: format})
+      |> via_out(:output)
+      |> via_in(Membrane.Pad.ref(:input, :sidebar_pad), options: [role: :custom_role])
+      |> get_child(:mixer),
+      get_child(:mixer)
+      |> child(:sink, Sink)
+    ]
+
+    pipeline = Pipeline.start_link_supervised!(spec: spec)
+
+    # Wait for layout notification (primary_sidebar layout with both inputs)
+    # Note: Due to timing, we may not see the intermediate single_fit layout
+    notification = await_layout_notification(pipeline)
+    assert {:layout_updated, %{layout: layout, slots: slots}} = notification
+
+    # Verify we got a valid layout
+    assert layout in [:single_fit, :primary_sidebar]
+    assert Map.has_key?(slots, :primary)
+
+    # If we got primary_sidebar, verify the sidebar pad too
+    if layout == :primary_sidebar do
+      assert slots[:primary] == :primary
+      assert slots[Membrane.Pad.ref(:input, :sidebar_pad)] == :sidebar
+    end
+
+    Pipeline.terminate(pipeline)
+  end
+
   # Helper functions
+
+  defp await_layout_notification(pipeline, timeout \\ @receive_timeout) do
+    receive do
+      {Membrane.Testing.Pipeline, ^pipeline,
+       {:handle_child_notification, {notification = {:layout_updated, _}, :mixer}}} ->
+        notification
+
+      {Membrane.Testing.Pipeline, ^pipeline, _other} ->
+        await_layout_notification(pipeline, timeout)
+    after
+      timeout ->
+        flunk("no layout_updated notification received within timeout")
+    end
+  end
 
   defp await_matching_buffer(pipeline, format, predicate, timeout \\ @receive_timeout) do
     deadline = System.monotonic_time(:millisecond) + timeout

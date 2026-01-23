@@ -158,7 +158,9 @@ defmodule Membrane.VideoMixer.Filter do
       # If this pad just became ready (received first frame), reset mixer state
       # so layout is rebuilt to include this pad
       queue = state.queue_by_pad[pad]
-      state = if not was_ready and FrameQueue.ready?(queue), do: reset_mixer_state(state), else: state
+
+      state =
+        if not was_ready and FrameQueue.ready?(queue), do: reset_mixer_state(state), else: state
 
       mix_or_drain(state)
     end
@@ -183,7 +185,6 @@ defmodule Membrane.VideoMixer.Filter do
       queue -> FrameQueue.closed?(queue)
     end
   end
-
 
   defp all_have_frames?(pads, state) do
     Enum.all?(pads, fn pad ->
@@ -274,7 +275,8 @@ defmodule Membrane.VideoMixer.Filter do
         {[end_of_stream: :output], %{state | closed?: true}}
 
       true ->
-        mix(state, [])
+        {actions, state} = mix(state, [])
+        {actions, prune_closed_pads(state)}
     end
   end
 
@@ -419,6 +421,27 @@ defmodule Membrane.VideoMixer.Filter do
           queue -> FrameQueue.push(queue, :end_of_stream)
         end)
     end
+  end
+
+  defp prune_closed_pads(state) do
+    {state, removed?} =
+      state.queue_by_pad
+      |> Enum.reduce({state, false}, fn {pad, queue}, {state, removed?} ->
+        if FrameQueue.closed?(queue) do
+          new_state =
+            state
+            |> update_in([:queue_by_pad], &Map.delete(&1, pad))
+            |> update_in([:pad_roles], &Map.delete(&1, pad))
+            |> update_in([:fit_mode_by_pad], &Map.delete(&1, pad))
+            |> update_in([:pad_order], &Enum.reject(&1, fn item -> item == pad end))
+
+          {new_state, true}
+        else
+          {state, removed?}
+        end
+      end)
+
+    if removed?, do: reset_mixer_state(state), else: state
   end
 
   defp build_frame_spec(state, role, pad, caps) do
@@ -583,7 +606,10 @@ defmodule Membrane.VideoMixer.Filter do
   defp layout_slot_order(:single_fit, _state), do: [:primary]
   defp layout_slot_order(:hstack, _state), do: [:left, :right]
   defp layout_slot_order(:vstack, _state), do: [:top, :bottom]
-  defp layout_slot_order(:xstack, _state), do: [:top_left, :top_right, :bottom_left, :bottom_right]
+
+  defp layout_slot_order(:xstack, _state),
+    do: [:top_left, :top_right, :bottom_left, :bottom_right]
+
   defp layout_slot_order(:primary_sidebar, _state), do: [:primary, :sidebar]
 
   defp layout_slot_order(other, _state),

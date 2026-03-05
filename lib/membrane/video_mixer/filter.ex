@@ -611,6 +611,7 @@ defmodule Membrane.VideoMixer.Filter do
     do: [:top_left, :top_right, :bottom_left, :bottom_right]
 
   defp layout_slot_order(:primary_sidebar, _state), do: [:primary, :sidebar]
+  defp layout_slot_order(:primary_sidebar_cropped, _state), do: [:primary, :sidebar]
 
   defp layout_slot_order(other, _state),
     do: raise("invalid layout: #{inspect(other)}")
@@ -661,6 +662,10 @@ defmodule Membrane.VideoMixer.Filter do
   end
 
   defp layout_roles(:primary_sidebar, state) do
+    [resolve_slot(:primary, state), resolve_slot(:sidebar, state)]
+  end
+
+  defp layout_roles(:primary_sidebar_cropped, state) do
     [resolve_slot(:primary, state), resolve_slot(:sidebar, state)]
   end
 

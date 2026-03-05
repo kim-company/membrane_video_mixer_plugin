@@ -1,7 +1,7 @@
 defmodule Membrane.VideoMixer.MixProject do
   use Mix.Project
 
-  @version "2.2.1"
+  @version "2.2.2"
   @link "https://github.com/kim-company/membrane_video_mixer_plugin"
 
   def project do

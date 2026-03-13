@@ -156,13 +156,19 @@ defmodule Membrane.VideoMixer.Filter do
       state = update_in(state, [:queue_by_pad, pad], &FrameQueue.push(&1, frame))
 
       # If this pad just became ready (received first frame), reset mixer state
-      # so layout is rebuilt to include this pad
+      # so layout is rebuilt to include this pad, and notify parent.
       queue = state.queue_by_pad[pad]
 
-      state =
-        if not was_ready and FrameQueue.ready?(queue), do: reset_mixer_state(state), else: state
+      {notify_actions, state} =
+        if not was_ready and FrameQueue.ready?(queue) do
+          role = pad_role!(state, pad)
+          {[notify_parent: {:pad_ready, role}], reset_mixer_state(state)}
+        else
+          {[], state}
+        end
 
-      mix_or_drain(state)
+      {mix_actions, state} = mix_or_drain(state)
+      {notify_actions ++ mix_actions, state}
     end
   end
 
@@ -173,6 +179,10 @@ defmodule Membrane.VideoMixer.Filter do
 
   def handle_parent_notification({:rebuild_filter_graph, builder_state}, _ctx, state) do
     {[], state |> flush_non_primary_queues() |> reset_mixer_state() |> Map.put(:builder_state, builder_state)}
+  end
+
+  def handle_parent_notification({:update_builder_state, builder_state}, _ctx, state) do
+    {[], %{state | builder_state: builder_state}}
   end
 
   defp stream_finished?(ctx) do

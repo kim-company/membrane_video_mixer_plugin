@@ -168,11 +168,11 @@ defmodule Membrane.VideoMixer.Filter do
 
   @impl true
   def handle_parent_notification(:rebuild_filter_graph, _ctx, state) do
-    {[], %{state | mixer: nil, layout_choice: nil}}
+    {[], state |> flush_non_primary_queues() |> reset_mixer_state()}
   end
 
   def handle_parent_notification({:rebuild_filter_graph, builder_state}, _ctx, state) do
-    {[], %{state | mixer: nil, layout_choice: nil, builder_state: builder_state}}
+    {[], state |> flush_non_primary_queues() |> reset_mixer_state() |> Map.put(:builder_state, builder_state)}
   end
 
   defp stream_finished?(ctx) do
@@ -561,6 +561,16 @@ defmodule Membrane.VideoMixer.Filter do
             {nil, state, []}
         end
     end
+  end
+
+  defp flush_non_primary_queues(state) do
+    queue_by_pad =
+      Map.new(state.queue_by_pad, fn
+        {:primary, queue} -> {:primary, queue}
+        {pad, queue} -> {pad, FrameQueue.flush_to_latest(queue)}
+      end)
+
+    %{state | queue_by_pad: queue_by_pad}
   end
 
   defp reset_mixer_state(state) do

@@ -22,6 +22,15 @@ defmodule Membrane.VideoMixer.FilterImageOverlayTest do
     [0, 1]
   }
 
+  @primary_sidebar_overlay_graph {
+    "[0:v]scale=48:48[l];" <>
+      "[1:v]scale=16:48[r];" <>
+      "[l][r]hstack=inputs=2[base];" <>
+      "[2:v]format=yuva420p,scale=48:48[ovl];" <>
+      "[base][ovl]overlay=x=0:y=0:format=yuv420[out]",
+    [0, 2, 1]
+  }
+
   test "an RGBA overlay pad covers the primary; removing it restores the primary" do
     width = 64
     height = 48
@@ -75,9 +84,81 @@ defmodule Membrane.VideoMixer.FilterImageOverlayTest do
     Pipeline.terminate(pipeline)
   end
 
+  test "raw overlay layout accepts tuple roles used by live interpreter branches" do
+    width = 64
+    height = 48
+    interpreter_role = {:interpreter, "ing-a"}
+
+    i420 = FrameGenerator.stream_format(width, height, framerate: {30, 1}, pixel_format: :I420)
+    rgba = FrameGenerator.stream_format(width, height, framerate: {30, 1}, pixel_format: :RGBA)
+
+    {green_state, green_gen} = FrameGenerator.green_generator(i420)
+    {blue_state, blue_gen} = FrameGenerator.blue_generator(i420)
+    {red_state, red_gen} = FrameGenerator.red_generator(rgba)
+
+    layout_builder = fn _output_spec, specs_by_role, _state ->
+      cond do
+        Map.has_key?(specs_by_role, interpreter_role) and
+            Map.has_key?(specs_by_role, :image_overlay) ->
+          {:raw, @primary_sidebar_overlay_graph}
+
+        Map.has_key?(specs_by_role, :image_overlay) ->
+          {:raw, @overlay_graph}
+
+        true ->
+          {:layout, :single_fit}
+      end
+    end
+
+    spec = [
+      child(:primary, %DynamicSource{output: {green_state, green_gen}, stream_format: i420})
+      |> via_out(:output)
+      |> via_in(:primary, options: [role: :srt])
+      |> child(:mixer, %Membrane.VideoMixer.Filter{layout_builder: layout_builder}),
+      get_child(:mixer)
+      |> child(:sink, Sink)
+    ]
+
+    pipeline = Pipeline.start_link_supervised!(spec: spec)
+
+    _ = await_matching_buffer(pipeline, i420, &center_y_in?(&1, &2, 140..160))
+
+    Pipeline.execute_actions(pipeline,
+      spec: [
+        child(:overlay, %DynamicSource{output: {red_state, red_gen}, stream_format: rgba})
+        |> via_out(:output)
+        |> via_in(Membrane.Pad.ref(:input, :image_overlay), options: [role: :image_overlay])
+        |> get_child(:mixer)
+      ]
+    )
+
+    _ = await_matching_buffer(pipeline, i420, &center_y_in?(&1, &2, 60..100))
+
+    Pipeline.execute_actions(pipeline,
+      spec: [
+        child(:interpreter, %DynamicSource{output: {blue_state, blue_gen}, stream_format: i420})
+        |> via_out(:output)
+        |> via_in(Membrane.Pad.ref(:input, interpreter_role), options: [role: interpreter_role])
+        |> get_child(:mixer)
+      ]
+    )
+
+    _ = await_matching_buffer(pipeline, i420, &primary_overlay_with_sidebar?/2)
+
+    Pipeline.terminate(pipeline)
+  end
+
   defp center_y_in?(payload, format, range) do
     samples = FrameSampler.sample_center_area(payload, format, 8, 8)
     Enum.all?(samples, fn {y, _u, _v} -> y in range end)
+  end
+
+  defp primary_overlay_with_sidebar?(payload, format) do
+    overlay_samples = FrameSampler.sample_area(payload, format, 16, 20, 4, 4)
+    sidebar_samples = FrameSampler.sample_area(payload, format, 56, 20, 4, 4)
+
+    Enum.all?(overlay_samples, fn {y, _u, _v} -> y in 60..100 end) and
+      Enum.all?(sidebar_samples, fn {y, _u, _v} -> y in 20..50 end)
   end
 
   defp await_matching_buffer(pipeline, format, predicate, timeout \\ @receive_timeout) do

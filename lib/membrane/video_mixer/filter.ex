@@ -178,7 +178,11 @@ defmodule Membrane.VideoMixer.Filter do
   end
 
   def handle_parent_notification({:rebuild_filter_graph, builder_state}, _ctx, state) do
-    {[], state |> flush_non_primary_queues() |> reset_mixer_state() |> Map.put(:builder_state, builder_state)}
+    {[],
+     state
+     |> flush_non_primary_queues()
+     |> reset_mixer_state()
+     |> Map.put(:builder_state, builder_state)}
   end
 
   def handle_parent_notification({:update_builder_state, builder_state}, _ctx, state) do
@@ -363,8 +367,6 @@ defmodule Membrane.VideoMixer.Filter do
     # Rebuild mixer if needed
     mixer =
       if specs_changed? or state.mixer == nil do
-        required_pads = Map.keys(popped_by_pad)
-
         case state.layout_choice do
           {:layout, layout} ->
             # Normalize role names to match VideoMixer expectations
@@ -373,8 +375,9 @@ defmodule Membrane.VideoMixer.Filter do
             m
 
           {:raw, filter_graph} ->
-            specs = Enum.map(required_pads, &Map.fetch!(specs_by_role, pad_role!(state, &1)))
-            roles = Enum.map(required_pads, &pad_role!(state, &1))
+            {filter_graph, specs, roles} =
+              normalize_raw_mixer_inputs(filter_graph, popped_by_pad, specs_by_role, state)
+
             {:ok, m} = VideoMixer.init_raw(filter_graph, specs, roles, output_spec)
             m
         end
@@ -389,10 +392,10 @@ defmodule Membrane.VideoMixer.Filter do
           normalize_frames_for_layout(frames_by_role, layout, state)
 
         {:raw, _} ->
-          frames_by_role
+          Map.take(frames_by_role, mixer.input_order)
       end
 
-    case VideoMixer.mix(mixer, Map.to_list(normalized_frames)) do
+    case VideoMixer.mix(mixer, normalized_frames) do
       {:ok, raw_frame} ->
         buffer = %Membrane.Buffer{payload: raw_frame, pts: frames_by_role[primary_role].pts}
         {%{state | mixer: mixer}, buffer}
@@ -418,6 +421,34 @@ defmodule Membrane.VideoMixer.Filter do
     state
     |> put_in([:queue_by_pad, pad], FrameQueue.new())
     |> update_in([:pad_order], fn pad_order -> pad_order ++ [pad] end)
+  end
+
+  defp popped_pads_in_input_order(popped_by_pad, state) do
+    state.pad_order
+    |> Enum.filter(&Map.has_key?(popped_by_pad, &1))
+  end
+
+  defp normalize_raw_mixer_inputs({graph, filter_indexes}, popped_by_pad, specs_by_role, state) do
+    pads_by_input_order = popped_pads_in_input_order(popped_by_pad, state)
+    graph_pads = Enum.map(filter_indexes, &fetch_raw_graph_pad!(pads_by_input_order, &1))
+
+    specs = Enum.map(graph_pads, &Map.fetch!(specs_by_role, pad_role!(state, &1)))
+    roles = Enum.map(graph_pads, &pad_role!(state, &1))
+
+    {{graph, identity_filter_indexes(graph_pads)}, specs, roles}
+  end
+
+  defp fetch_raw_graph_pad!(pads_by_input_order, index) do
+    case Enum.at(pads_by_input_order, index) do
+      nil -> raise "invalid raw filter index #{inspect(index)}"
+      pad -> pad
+    end
+  end
+
+  defp identity_filter_indexes([]), do: []
+
+  defp identity_filter_indexes(items) do
+    Enum.to_list(0..(length(items) - 1))
   end
 
   defp close_frame_queue(state, pad) do
